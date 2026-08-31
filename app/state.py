@@ -41,6 +41,9 @@ class InvoiceState(TypedDict, total=False):
     erp_fields: dict
     po_receipt_valid: bool
 
+    # Execute Command (mv to processed_files)
+    processed_file_path: str
+
     # HTTP Request5
     create_po_response: dict
 

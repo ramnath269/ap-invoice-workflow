@@ -1,9 +1,8 @@
 """Final PO write-back + workflow metrics.
 
-Ports n8n's "HTTP Request5" (create-po, form-encoded body) and
-"HTTP Request6" (workflow-metrics, JSON body) nodes.
+Ports n8n's "HTTP Request5" (create-po) and "HTTP Request6"
+(workflow-metrics) nodes.
 """
-import json
 import time
 
 import requests
@@ -11,15 +10,17 @@ import requests
 from .settings import settings
 
 
-def create_po(pdf_fields: dict, erp_fields: dict, file_name: str) -> dict:
+def create_po(pdf_fields: dict, erp_fields: dict, file_path: str) -> dict:
     resp = requests.post(
         f"{settings.INVOICE_SERVER_BASE_URL}/create-po",
-        # n8n's bodyParameters form-encodes object values as JSON strings -
-        # mirrored here since the receiving endpoint expects that shape.
-        data={
-            "pdf_fields": json.dumps(pdf_fields),
-            "erp_fields": json.dumps(erp_fields),
-            "file_path": f"/{settings.PROCESSED_SUBFOLDER}/{file_name}",
+        # n8n's bodyParameters node sent form-encoded data, but the server's
+        # Express handler destructures req.body assuming JSON (confirmed by
+        # its "Cannot destructure ... req.body is undefined" 500 response to
+        # a form-encoded request) - so this sends JSON instead.
+        json={
+            "pdf_fields": pdf_fields,
+            "erp_fields": erp_fields,
+            "file_path": file_path,
         },
         timeout=60,
     )

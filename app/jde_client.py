@@ -3,9 +3,13 @@
 Ports n8n's "Code in JavaScript2" (payload builder) and "Voucher Match"
 (HTTP POST to the JDE orchestrator) nodes.
 """
+import logging
+
 import requests
 
 from .settings import settings
+
+logger = logging.getLogger("ap_invoice_workflow")
 
 RECEIPT_INQUIRY_KEY = "55_DREQ_PO_ReceiptFile_Inquiry_V2"
 
@@ -35,6 +39,13 @@ def build_payload(extracted: dict) -> dict:
 
 
 def voucher_match(payload: dict) -> dict:
+    if settings.JDE_MOCK_MODE:
+        logger.warning(
+            "JDE_MOCK_MODE is on - returning a canned response instead of calling %s",
+            settings.JDE_ORCHESTRATOR_URL,
+        )
+        return {RECEIPT_INQUIRY_KEY: {"records": settings.JDE_MOCK_RECORDS}}
+
     resp = requests.post(settings.JDE_ORCHESTRATOR_URL, json=payload, timeout=60)
     resp.raise_for_status()
     return resp.json()

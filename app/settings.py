@@ -41,6 +41,12 @@ class Settings:
     )
     JDE_USERNAME = os.environ.get("JDE_USERNAME")
     JDE_PASSWORD = os.environ.get("JDE_PASSWORD")
+    # For local/offline testing when the JDE orchestrator isn't reachable
+    # from this machine (e.g. it needs a VPN or an allowlisted network).
+    # Never leave this on against a real deployment - it skips the PO
+    # receipt-validity check entirely.
+    JDE_MOCK_MODE = os.environ.get("JDE_MOCK_MODE", "false").lower() == "true"
+    JDE_MOCK_RECORDS = int(os.environ.get("JDE_MOCK_RECORDS", "1"))
 
     # HTTP Request5 / HTTP Request6
     INVOICE_SERVER_BASE_URL = os.environ.get(

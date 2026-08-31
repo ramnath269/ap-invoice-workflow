@@ -93,10 +93,14 @@ def route_after_voucher_match(state: InvoiceState) -> str:
 
 
 def move_file_to_processed(state: InvoiceState) -> dict:
+    # os.path.join discards WATCH_FOLDER if PROCESSED_SUBFOLDER is itself
+    # absolute, which is fine - it just means "processed files go here"
+    # regardless of where they were watched from.
     processed_dir = os.path.join(settings.WATCH_FOLDER, settings.PROCESSED_SUBFOLDER)
     os.makedirs(processed_dir, exist_ok=True)
-    shutil.move(state["file_path"], os.path.join(processed_dir, state["file_name"]))
-    return {}
+    destination = os.path.join(processed_dir, state["file_name"])
+    shutil.move(state["file_path"], destination)
+    return {"processed_file_path": destination}
 
 
 def attach_account_numbers(state: InvoiceState) -> dict:
@@ -112,7 +116,7 @@ def create_po(state: InvoiceState) -> dict:
     response = invoice_server.create_po(
         pdf_fields=state["extracted"],
         erp_fields=state["erp_fields"],
-        file_name=state["file_name"],
+        file_path=state["processed_file_path"],
     )
     return {"create_po_response": response}
 
@@ -160,12 +164,15 @@ def build_graph():
         graph.add_node(name, fn)
 
     # Fan-out: schema build and OCR+sanitize run in parallel, join at call_gemini.
+    # NOTE: a real AND-join needs the source nodes passed as a single list to
+    # one add_edge call - two separate add_edge(...) calls into the same
+    # target are an OR-trigger (the node runs after the first predecessor to
+    # finish, not after all of them), which fired call_gemini prematurely.
     graph.add_edge(START, "load_schema")
     graph.add_edge(START, "read_and_encode_file")
     graph.add_edge("read_and_encode_file", "run_ocr")
     graph.add_edge("run_ocr", "sanitize_text")
-    graph.add_edge("load_schema", "call_gemini")
-    graph.add_edge("sanitize_text", "call_gemini")
+    graph.add_edge(["load_schema", "sanitize_text"], "call_gemini")
 
     graph.add_edge("call_gemini", "parse_gemini_response")
     graph.add_conditional_edges(
