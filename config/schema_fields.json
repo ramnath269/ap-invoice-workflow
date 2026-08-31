@@ -1,0 +1,32 @@
+{
+  "fields": [
+    { "name": "invoice_date", "type": "string", "is_array": false },
+    { "name": "vendor", "type": "string", "is_array": false },
+    { "name": "purchase_order", "type": "string", "is_array": false },
+    { "name": "due_date", "type": "string", "is_array": false },
+    { "name": "payment_terms", "type": "string", "is_array": false },
+    { "name": "sub_total", "type": "string", "is_array": false },
+    { "name": "county_level_tax", "type": "string", "is_array": false },
+    { "name": "state_level_tax", "type": "string", "is_array": false },
+    { "name": "sales_tax", "type": "string", "is_array": false },
+    { "name": "special_level_tax", "type": "string", "is_array": false },
+    { "name": "total_freight", "type": "string", "is_array": false, "account_number": "153911.5630" },
+    { "name": "total_amount_due", "type": "string", "is_array": false },
+    { "name": "invoice_number", "type": "string", "is_array": false },
+    { "name": "products", "type": "array", "is_array": true },
+    { "name": "currency", "type": "string", "is_array": false },
+    { "name": "handling_fee", "type": "string", "is_array": false, "account_number": "153911.5630" }
+  ],
+  "array_fields": [
+    { "array_name": "products", "field_name": "item", "type": "string" },
+    { "array_name": "products", "field_name": "description", "type": "string" },
+    { "array_name": "products", "field_name": "quantity", "type": "string" },
+    { "array_name": "products", "field_name": "unit_price", "type": "string" },
+    { "array_name": "products", "field_name": "unit_of_measure", "type": "string" },
+    { "array_name": "products", "field_name": "amount", "type": "string" },
+    { "array_name": "products", "field_name": "supplier_item_number", "type": "string" },
+    { "array_name": "products", "field_name": "purchase_order_number", "type": "string" },
+    { "array_name": "products", "field_name": "item_number", "type": "string" },
+    { "array_name": "products", "field_name": "line_number", "type": "string" }
+  ]
+}

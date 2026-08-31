@@ -1,0 +1,29 @@
+# Secrets / local config
+.env
+*.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Google Cloud service account keys, if dropped in the repo
+*.json.key
+service-account*.json
+gcloud-credentials*.json
+
+# Local invoice files picked up by the watcher, if run against a repo-local folder
+*.pdf
+processed_files/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
