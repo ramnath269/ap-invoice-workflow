@@ -4,12 +4,15 @@ Ports n8n's "Gemini Vertex AI1" (schema-constrained generateContent call)
 and "Parse Gemini JSON1" (strip markdown fences, JSON.parse) nodes.
 """
 import json
+import logging
 import re
 
 import requests
 
 from .google_auth import get_access_token
 from .settings import settings
+
+logger = logging.getLogger("ap_invoice_workflow")
 
 _INSTRUCTIONS = """You are an information extraction engine.
 You must extract fields EXACTLY according to the provided JSON schema.
@@ -54,6 +57,13 @@ def extract(document_text: str, response_schema: dict) -> dict:
             "responseSchema": response_schema,
         },
     }
+    logger.info(
+        "gemini_extract.extract: POST %s model=%s doc_chars=%d schema_fields=%s",
+        url,
+        settings.GEMINI_MODEL,
+        len(document_text),
+        list(response_schema.get("properties", {}).keys()),
+    )
     resp = requests.post(
         url,
         headers={
@@ -65,7 +75,13 @@ def extract(document_text: str, response_schema: dict) -> dict:
         timeout=180,
     )
     resp.raise_for_status()
-    return resp.json()
+    data = resp.json()
+    logger.info(
+        "gemini_extract.extract: response received | usage=%s finish_reason=%s",
+        data.get("usageMetadata"),
+        data.get("candidates", [{}])[0].get("finishReason"),
+    )
+    return data
 
 
 def parse_response(raw_response: dict) -> dict:
@@ -76,6 +92,9 @@ def parse_response(raw_response: dict) -> dict:
     text = raw_response["candidates"][0]["content"]["parts"][0]["text"]
     cleaned = re.sub(r"```json|```", "", text).strip()
     try:
-        return {"output": json.loads(cleaned)}
+        output = json.loads(cleaned)
+        logger.info("gemini_extract.parse_response: parsed OK | fields=%s", list(output.keys()))
+        return {"output": output}
     except json.JSONDecodeError as exc:
+        logger.error("gemini_extract.parse_response: JSON parse failed | error=%s", exc)
         return {"parse_error": True, "error": str(exc), "raw_output": text}

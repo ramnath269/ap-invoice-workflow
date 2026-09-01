@@ -28,9 +28,11 @@ Everything else - including the two real parallel branches (schema
 building vs. OCR+sanitize, both joined at call_gemini) and the If2 gate on
 PO receipt records - is preserved.
 """
+import json
 import logging
 import os
 import shutil
+import time
 import uuid
 
 from langgraph.graph import END, START, StateGraph
@@ -40,6 +42,77 @@ from .settings import settings
 from .state import InvoiceState
 
 logger = logging.getLogger("ap_invoice_workflow")
+
+# Fields too large or too sensitive to dump whole into a log line. Node
+# output logging below truncates the former and redacts the latter -
+# base64_content alone is ~300KB for a typical invoice PDF.
+_TRUNCATE_KEYS = {"base64_content", "ocr_text", "sanitized_text"}
+_REDACT_KEYS = {"password"}
+_MAX_LOG_LEN = 800
+
+_RULE = "-" * 70
+
+
+def _for_log(value, key=None):
+    """Redacts secrets, truncates huge blobs, and - critically - flattens
+    embedded newlines out of every string. Real PDF-extracted text (ocr_text,
+    sanitized_text) contains actual \\n characters, and systemd's journal
+    capture treats stdout as line-oriented: a log line with a literal
+    newline in it gets split into multiple journal entries that lose their
+    logger prefix on every line after the first."""
+    if isinstance(value, dict):
+        return {k: _for_log(v, k) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_for_log(v) for v in value]
+    if key in _REDACT_KEYS:
+        return "<redacted>"
+    if isinstance(value, str):
+        flat = value.replace("\n", " ").replace("\r", " ")
+        if key in _TRUNCATE_KEYS and len(flat) > _MAX_LOG_LEN:
+            return f"<{len(flat)} chars> {flat[:_MAX_LOG_LEN]}..."
+        return flat
+    return value
+
+
+def _format_output_lines(result: dict) -> list[str]:
+    """Renders a node's output as one 'key: value' line per field instead of
+    a single giant JSON blob, so it can actually be scanned by eye. Each
+    string returned here is logged as its own logger.info() call - a single
+    call with embedded newlines gets shredded by systemd's line-oriented
+    journal capture, losing the log prefix on every line but the first."""
+    if not result:
+        return ["    (no new data)"]
+    lines = []
+    for key, raw_value in _for_log(result).items():
+        value_str = json.dumps(raw_value, default=str) if isinstance(raw_value, (dict, list)) else str(raw_value)
+        lines.append(f"    {key}: {value_str}")
+    return lines
+
+
+def _log_node(name, fn):
+    """Wraps a node so its start/end and the data it produced are always
+    logged, regardless of whether the graph is run via `langgraph dev` (which
+    auto-tags stdlib log records with the active node) or via the folder
+    watcher's plain graph.invoke() (which doesn't)."""
+
+    def wrapper(state):
+        logger.info(">> START %s", name)
+        started = time.monotonic()
+        try:
+            result = fn(state)
+        except Exception:
+            elapsed = time.monotonic() - started
+            logger.exception("!! FAILED %s (%.2fs)", name, elapsed)
+            logger.info(_RULE)
+            raise
+        elapsed = time.monotonic() - started
+        logger.info("OK DONE  %-28s (%.2fs)", name, elapsed)
+        for line in _format_output_lines(result):
+            logger.info(line)
+        logger.info(_RULE)
+        return result
+
+    return wrapper
 
 
 def load_schema(state: InvoiceState) -> dict:
@@ -72,7 +145,9 @@ def parse_gemini_response(state: InvoiceState) -> dict:
 
 
 def route_after_parse(state: InvoiceState) -> str:
-    return "handle_parse_error" if state.get("parse_error") else "build_voucher_payload"
+    route = "handle_parse_error" if state.get("parse_error") else "build_voucher_payload"
+    logger.info(">> ROUTE   route_after_parse: parse_error=%s => %s", state.get("parse_error"), route)
+    return route
 
 
 def build_voucher_payload(state: InvoiceState) -> dict:
@@ -89,7 +164,13 @@ def call_voucher_match(state: InvoiceState) -> dict:
 
 
 def route_after_voucher_match(state: InvoiceState) -> str:
-    return "move_file_to_processed" if state.get("po_receipt_valid") else "skip_no_receipt"
+    route = "move_file_to_processed" if state.get("po_receipt_valid") else "skip_no_receipt"
+    logger.info(
+        ">> ROUTE   route_after_voucher_match: po_receipt_valid=%s => %s",
+        state.get("po_receipt_valid"),
+        route,
+    )
+    return route
 
 
 def move_file_to_processed(state: InvoiceState) -> dict:
@@ -161,7 +242,7 @@ def build_graph():
         ("skip_no_receipt", skip_no_receipt),
         ("handle_parse_error", handle_parse_error),
     ]:
-        graph.add_node(name, fn)
+        graph.add_node(name, _log_node(name, fn))
 
     # Fan-out: schema build and OCR+sanitize run in parallel, join at call_gemini.
     # NOTE: a real AND-join needs the source nodes passed as a single list to

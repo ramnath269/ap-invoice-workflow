@@ -27,7 +27,7 @@ def build_payload(extracted: dict) -> dict:
         }
         for i, p in enumerate(products)
     ]
-    return {
+    payload = {
         "username": settings.JDE_USERNAME,
         "password": settings.JDE_PASSWORD,
         "OrderNumber": str(extracted.get("purchase_order") or ""),
@@ -36,6 +36,13 @@ def build_payload(extracted: dict) -> dict:
         "VendorInvoiceNo": extracted.get("invoice_number") or "",
         "Detail": detail,
     }
+    logger.info(
+        "jde_client.build_payload: OrderNumber=%s VendorInvoiceNo=%s line_items=%d",
+        payload["OrderNumber"],
+        payload["VendorInvoiceNo"],
+        len(detail),
+    )
+    return payload
 
 
 def voucher_match(payload: dict) -> dict:
@@ -46,11 +53,26 @@ def voucher_match(payload: dict) -> dict:
         )
         return {RECEIPT_INQUIRY_KEY: {"records": settings.JDE_MOCK_RECORDS}}
 
+    logger.info(
+        "jde_client.voucher_match: POST %s OrderNumber=%s VendorInvoiceNo=%s",
+        settings.JDE_ORCHESTRATOR_URL,
+        payload.get("OrderNumber"),
+        payload.get("VendorInvoiceNo"),
+    )
     resp = requests.post(settings.JDE_ORCHESTRATOR_URL, json=payload, timeout=60)
     resp.raise_for_status()
-    return resp.json()
+    data = resp.json()
+    logger.info(
+        "jde_client.voucher_match: response ErrorCode=%s ErrorMessage=%s records=%s",
+        data.get("ErrorCode"),
+        data.get("ErrorMessage"),
+        data.get(RECEIPT_INQUIRY_KEY, {}).get("records"),
+    )
+    return data
 
 
 def has_receipt_records(voucher_match_response: dict) -> bool:
     records = voucher_match_response.get(RECEIPT_INQUIRY_KEY, {}).get("records", 0)
-    return bool(records and records > 0)
+    valid = bool(records and records > 0)
+    logger.info("jde_client.has_receipt_records: records=%s valid=%s", records, valid)
+    return valid

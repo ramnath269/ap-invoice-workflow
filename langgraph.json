@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "ap_invoice_workflow": "app.graph:build_graph"
+  },
+  "env": ".env"
+}

@@ -6,8 +6,11 @@ Ports n8n's "Code in JavaScript3" node, which built the same shape from the
 from __future__ import annotations
 
 import json
+import logging
 
 from .settings import settings
+
+logger = logging.getLogger("ap_invoice_workflow")
 
 _cache: dict | None = None
 
@@ -40,6 +43,11 @@ def build_extraction_schema() -> dict:
             }
         else:
             schema["properties"][key] = {"type": field["type"]}
+    logger.info(
+        "schema_builder.build_extraction_schema: %d fields (%d array fields)",
+        len(fields),
+        len(array_fields),
+    )
     return schema
 
 

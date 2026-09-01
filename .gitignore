@@ -23,6 +23,10 @@ gcloud-credentials*.json
 *.pdf
 processed_files/
 
+# Logs (services now log to journald - journalctl -u <service> - but these
+# get written when run directly, e.g. `python3 main.py > watcher.log`)
+*.log
+
 # Editor / OS
 .vscode/
 .idea/

@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 REQUIRED_VARS = ["JDE_USERNAME", "JDE_PASSWORD"]
+IMAP_REQUIRED_VARS = ["IMAP_HOST", "IMAP_USERNAME", "IMAP_PASSWORD"]
 
 
 class Settings:
@@ -59,6 +60,18 @@ class Settings:
         os.path.join(os.path.dirname(__file__), "..", "config", "schema_fields.json"),
     )
 
+    # Email trigger (IMAP) - polls a mailbox for new invoice emails and drops
+    # their PDF attachments into WATCH_FOLDER, where the existing folder
+    # watcher picks them up and runs them through the graph. This keeps graph
+    # invocation in one place instead of duplicating it per trigger.
+    IMAP_HOST = os.environ.get("IMAP_HOST")
+    IMAP_PORT = int(os.environ.get("IMAP_PORT", "993"))
+    IMAP_USE_SSL = os.environ.get("IMAP_USE_SSL", "true").lower() == "true"
+    IMAP_USERNAME = os.environ.get("IMAP_USERNAME")
+    IMAP_PASSWORD = os.environ.get("IMAP_PASSWORD")
+    IMAP_FOLDER = os.environ.get("IMAP_FOLDER", "INBOX")
+    IMAP_POLL_SECONDS = int(os.environ.get("IMAP_POLL_SECONDS", "60"))
+
 
 settings = Settings()
 
@@ -69,4 +82,13 @@ def validate() -> None:
         raise RuntimeError(
             f"Missing required environment variable(s): {', '.join(missing)}. "
             "Copy .env.example to .env and fill them in."
+        )
+
+
+def validate_imap() -> None:
+    missing = [name for name in IMAP_REQUIRED_VARS if not getattr(settings, name)]
+    if missing:
+        raise RuntimeError(
+            f"Missing required environment variable(s): {', '.join(missing)}. "
+            "Set IMAP_HOST / IMAP_USERNAME / IMAP_PASSWORD in .env to enable the email trigger."
         )
