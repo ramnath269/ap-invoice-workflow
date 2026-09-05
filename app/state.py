@@ -5,7 +5,8 @@ nodes as `$json` on the main path of the original workflow.
 """
 from __future__ import annotations
 
-from typing import TypedDict
+import operator
+from typing import Annotated, TypedDict
 
 
 class InvoiceState(TypedDict, total=False):
@@ -44,8 +45,22 @@ class InvoiceState(TypedDict, total=False):
     # Execute Command (mv to processed_files)
     processed_file_path: str
 
+    # resolve_item_numbers: lines JDE's voucher-match couldn't resolve that
+    # got a fuzzy-matched (quantity + unit price) candidate item number from
+    # a PO-lines lookup, for dashboard review - built once as a complete
+    # list per run, so no accumulator reducer needed here (contrast
+    # dependency_timings below, which multiple nodes append to over time).
+    item_suggestions: list[dict]
+
     # HTTP Request5
     create_po_response: dict
 
     # Terminal status, for logging / metrics
     status: str
+
+    # Per-external-call timing/status, one entry per dependency call
+    # (document_ai, gemini, jde, invoice_server). Annotated with operator.add
+    # so each node's single-entry list gets concatenated onto the running
+    # list instead of overwriting it - LangGraph's standard pattern for
+    # append-only state fields.
+    dependency_timings: Annotated[list[dict], operator.add]

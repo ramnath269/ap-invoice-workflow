@@ -12,6 +12,7 @@ Node names mirror the original n8n nodes where practical:
   call_voucher_match       <- Voucher Match + Edit Fields2
   move_file_to_processed   <- Execute Command
   attach_account_numbers   <- Code in JavaScript1
+  resolve_item_numbers     <- (new) item_crossref cache + jde_mcp_client PO-lines fuzzy match
   create_po                <- HTTP Request5
   report_metrics_success   <- HTTP Request6
 
@@ -37,7 +38,7 @@ import uuid
 
 from langgraph.graph import END, START, StateGraph
 
-from . import document_ai, gemini_extract, guardrails, invoice_server, jde_client, schema_builder
+from . import document_ai, gemini_extract, guardrails, invoice_server, jde_client, jde_mcp_client, schema_builder
 from .settings import settings
 from .state import InvoiceState
 
@@ -89,6 +90,45 @@ def _format_output_lines(result: dict) -> list[str]:
     return lines
 
 
+def _time_dependency(dependency: str, op: str, started: float, status: str, error: str | None = None) -> dict:
+    """Times and logs one external call (Document AI / Gemini / JDE /
+    invoice-server) as a consistent, grep-able METRIC line, and returns the
+    same data as a dict for the calling node to fold into
+    state["dependency_timings"]."""
+    duration_ms = int((time.monotonic() - started) * 1000)
+    if status == "ok":
+        logger.info("METRIC dependency=%s op=%s status=ok duration_ms=%d", dependency, op, duration_ms)
+    else:
+        logger.warning(
+            "METRIC dependency=%s op=%s status=error duration_ms=%d error=%s",
+            dependency, op, duration_ms, error,
+        )
+    timing = {"dependency": dependency, "op": op, "status": status, "duration_ms": duration_ms}
+    if error:
+        timing["error"] = error
+    return timing
+
+
+def _report_exception_metrics(state: InvoiceState, node_name: str, exc: Exception) -> None:
+    """Reports the 'exception' outcome for #1 (outcome classification) when
+    any node raises. Only prior nodes' successful dependency_timings are
+    available here - the failing call's own timing was already logged by
+    _time_dependency at its point of failure, but LangGraph only accumulates
+    state from nodes that actually return, so it can't also land in this
+    payload."""
+    execution_start_ms = state.get("execution_start_ms")
+    if not execution_start_ms:
+        return
+    invoice_server.report_metrics(
+        execution_id=str(uuid.uuid4()),
+        status="exception",
+        execution_start_ms=execution_start_ms,
+        failed_node=node_name,
+        error=f"{type(exc).__name__}: {exc}",
+        dependency_timings=state.get("dependency_timings"),
+    )
+
+
 def _log_node(name, fn):
     """Wraps a node so its start/end and the data it produced are always
     logged, regardless of whether the graph is run via `langgraph dev` (which
@@ -100,10 +140,11 @@ def _log_node(name, fn):
         started = time.monotonic()
         try:
             result = fn(state)
-        except Exception:
+        except Exception as exc:
             elapsed = time.monotonic() - started
             logger.exception("!! FAILED %s (%.2fs)", name, elapsed)
             logger.info(_RULE)
+            _report_exception_metrics(state, name, exc)
             raise
         elapsed = time.monotonic() - started
         logger.info("OK DONE  %-28s (%.2fs)", name, elapsed)
@@ -125,7 +166,14 @@ def read_and_encode_file(state: InvoiceState) -> dict:
 
 
 def run_ocr(state: InvoiceState) -> dict:
-    return {"ocr_text": document_ai.run_ocr(state["base64_content"], state["mime_type"])}
+    started = time.monotonic()
+    try:
+        text = document_ai.run_ocr(state["base64_content"], state["mime_type"])
+    except Exception as exc:
+        _time_dependency("document_ai", "run_ocr", started, "error", f"{type(exc).__name__}: {exc}")
+        raise
+    timing = _time_dependency("document_ai", "run_ocr", started, "ok")
+    return {"ocr_text": text, "dependency_timings": [timing]}
 
 
 def sanitize_text(state: InvoiceState) -> dict:
@@ -133,8 +181,14 @@ def sanitize_text(state: InvoiceState) -> dict:
 
 
 def call_gemini(state: InvoiceState) -> dict:
-    raw = gemini_extract.extract(state["sanitized_text"], state["extraction_schema"])
-    return {"gemini_raw_response": raw}
+    started = time.monotonic()
+    try:
+        raw = gemini_extract.extract(state["sanitized_text"], state["extraction_schema"])
+    except Exception as exc:
+        _time_dependency("gemini", "extract", started, "error", f"{type(exc).__name__}: {exc}")
+        raise
+    timing = _time_dependency("gemini", "extract", started, "ok")
+    return {"gemini_raw_response": raw, "dependency_timings": [timing]}
 
 
 def parse_gemini_response(state: InvoiceState) -> dict:
@@ -155,11 +209,18 @@ def build_voucher_payload(state: InvoiceState) -> dict:
 
 
 def call_voucher_match(state: InvoiceState) -> dict:
-    response = jde_client.voucher_match(state["voucher_match_payload"])
+    started = time.monotonic()
+    try:
+        response = jde_client.voucher_match(state["voucher_match_payload"])
+    except Exception as exc:
+        _time_dependency("jde", "voucher_match", started, "error", f"{type(exc).__name__}: {exc}")
+        raise
+    timing = _time_dependency("jde", "voucher_match", started, "ok")
     return {
         "voucher_match_response": response,
         "erp_fields": response,
         "po_receipt_valid": jde_client.has_receipt_records(response),
+        "dependency_timings": [timing],
     }
 
 
@@ -193,13 +254,138 @@ def attach_account_numbers(state: InvoiceState) -> dict:
     return {"extracted": extracted}
 
 
+def resolve_item_numbers(state: InvoiceState) -> dict:
+    """Fixes up lines where JDE's voucher-match couldn't resolve the
+    supplier's item number (a rowset entry with a non-blank Message, e.g.
+    "Unable to fetch Order/Item information"). Tries the invoice-server
+    item_crossref cache first - a previously user-confirmed mapping applies
+    immediately, no review needed - and on a cache miss falls back to
+    fetching the PO's lines via jde_mcp_client and fuzzy-matching by
+    quantity + unit price, attaching any single confident match as a
+    suggestion for dashboard review rather than applying it outright.
+
+    Deliberately never blocks create_po, even on its own bugs: an unresolved
+    or ambiguous line just proceeds with whatever item number it already
+    had, plus whatever suggestions were found along the way.
+    """
+    try:
+        return _resolve_item_numbers(state)
+    except Exception:
+        logger.exception(
+            "resolve_item_numbers: unexpected failure - proceeding without resolving or suggesting anything"
+        )
+        return {"item_suggestions": []}
+
+
+def _resolve_item_numbers(state: InvoiceState) -> dict:
+    rowset = state["voucher_match_response"].get(jde_client.RECEIPT_INQUIRY_KEY, {}).get("rowset", [])
+    extracted = dict(state["extracted"])
+    products = [dict(p) for p in extracted.get("products", [])]
+    supplier_number = state["erp_fields"].get("VendorNumber")
+    order_number = extracted.get("purchase_order")
+    order_type = state["erp_fields"].get("OrderType") or "OP"
+
+    suggestions = []
+    timings = []
+    po_lines = None  # fetched at most once per run, shared across every unresolved line on this PO
+
+    for row in rowset:
+        message = (row.get("Message") or "").strip()
+        if not message:
+            continue  # this line resolved fine, nothing to do
+
+        seq = row.get("SequenceNumber")
+        idx = seq - 1 if seq else None
+        if idx is None or not (0 <= idx < len(products)):
+            logger.warning(
+                "resolve_item_numbers: unresolved row has no matching product (seq=%s): %s", seq, message
+            )
+            continue
+
+        product = products[idx]
+        pdf_item_number = product.get("supplier_item_number") or product.get("item")
+        if not pdf_item_number:
+            continue
+
+        logger.warning(
+            "resolve_item_numbers: line %s unresolved (%s), supplier_item_number=%s", seq, message, pdf_item_number
+        )
+
+        started = time.monotonic()
+        assigned = invoice_server.lookup_item_crossref(supplier_number, pdf_item_number)
+        timings.append(_time_dependency("invoice_server", "lookup_item_crossref", started, "ok"))
+        if assigned:
+            logger.info(
+                "resolve_item_numbers: cache hit, supplier=%s item=%s -> %s", supplier_number, pdf_item_number, assigned
+            )
+            product["item_number"] = assigned
+            continue
+
+        try:
+            quantity = float(product.get("quantity") or 0)
+            unit_price = float(product.get("unit_price") or 0)
+        except (TypeError, ValueError):
+            quantity = unit_price = 0.0
+
+        if not quantity or not unit_price:
+            logger.warning(
+                "resolve_item_numbers: no quantity/unit_price to match on for line %s, skipping fuzzy match", seq
+            )
+            continue
+
+        if po_lines is None:
+            started = time.monotonic()
+            try:
+                po_lines = jde_mcp_client.get_po_lines(order_number, order_type)
+            except Exception as exc:
+                timings.append(
+                    _time_dependency("jde_mcp", "get_po_lines", started, "error", f"{type(exc).__name__}: {exc}")
+                )
+                logger.exception(
+                    "resolve_item_numbers: get_po_lines failed for PO %s - skipping fuzzy match for remaining lines",
+                    order_number,
+                )
+                po_lines = []
+            else:
+                timings.append(_time_dependency("jde_mcp", "get_po_lines", started, "ok"))
+
+        match = jde_mcp_client.find_matching_po_line(po_lines, quantity, unit_price)
+        if match:
+            suggested = str(match.get("ItemNumber"))
+            logger.info("resolve_item_numbers: fuzzy match for line %s -> %s", seq, suggested)
+            suggestions.append(
+                {
+                    "line_index": idx,
+                    "pdf_item_number": pdf_item_number,
+                    "suggested_jde_item_number": suggested,
+                    "quantity": quantity,
+                    "unit_price": unit_price,
+                    "match_basis": "quantity_and_unit_price",
+                }
+            )
+        else:
+            logger.warning(
+                "resolve_item_numbers: no confident match for line %s (supplier_item_number=%s)", seq, pdf_item_number
+            )
+
+    extracted["products"] = products
+    return {"extracted": extracted, "item_suggestions": suggestions, "dependency_timings": timings}
+
+
 def create_po(state: InvoiceState) -> dict:
-    response = invoice_server.create_po(
-        pdf_fields=state["extracted"],
-        erp_fields=state["erp_fields"],
-        file_path=state["processed_file_path"],
-    )
-    return {"create_po_response": response}
+    started = time.monotonic()
+    try:
+        response = invoice_server.create_po(
+            pdf_fields=state["extracted"],
+            erp_fields=state["erp_fields"],
+            file_path=state["processed_file_path"],
+            item_suggestions=state.get("item_suggestions"),
+        )
+    except Exception as exc:
+        _time_dependency("invoice_server", "create_po", started, "error", f"{type(exc).__name__}: {exc}")
+        raise
+    timing = _time_dependency("invoice_server", "create_po", started, "ok")
+    return {"create_po_response": response, "dependency_timings": [timing]}
 
 
 def report_metrics_success(state: InvoiceState) -> dict:
@@ -207,18 +393,32 @@ def report_metrics_success(state: InvoiceState) -> dict:
         execution_id=str(uuid.uuid4()),
         status="success",
         execution_start_ms=state["execution_start_ms"],
+        dependency_timings=state.get("dependency_timings"),
     )
     return {"status": "success"}
 
 
 def skip_no_receipt(state: InvoiceState) -> dict:
     logger.warning("No PO receipt records found for %s; skipping PO creation.", state["file_name"])
+    invoice_server.report_metrics(
+        execution_id=str(uuid.uuid4()),
+        status="skipped_no_receipt",
+        execution_start_ms=state["execution_start_ms"],
+        dependency_timings=state.get("dependency_timings"),
+    )
     return {"status": "skipped_no_receipt"}
 
 
 def handle_parse_error(state: InvoiceState) -> dict:
     logger.error(
         "Gemini output failed to parse for %s: %s", state["file_name"], state.get("parse_error_message")
+    )
+    invoice_server.report_metrics(
+        execution_id=str(uuid.uuid4()),
+        status="parse_error",
+        execution_start_ms=state["execution_start_ms"],
+        error=state.get("parse_error_message"),
+        dependency_timings=state.get("dependency_timings"),
     )
     return {"status": "parse_error"}
 
@@ -237,6 +437,7 @@ def build_graph():
         ("call_voucher_match", call_voucher_match),
         ("move_file_to_processed", move_file_to_processed),
         ("attach_account_numbers", attach_account_numbers),
+        ("resolve_item_numbers", resolve_item_numbers),
         ("create_po", create_po),
         ("report_metrics_success", report_metrics_success),
         ("skip_no_receipt", skip_no_receipt),
@@ -276,7 +477,8 @@ def build_graph():
     )
 
     graph.add_edge("move_file_to_processed", "attach_account_numbers")
-    graph.add_edge("attach_account_numbers", "create_po")
+    graph.add_edge("attach_account_numbers", "resolve_item_numbers")
+    graph.add_edge("resolve_item_numbers", "create_po")
     graph.add_edge("create_po", "report_metrics_success")
 
     graph.add_edge("report_metrics_success", END)

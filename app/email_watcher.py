@@ -34,6 +34,20 @@ def _decode_header_value(value: str | None) -> str:
     return "".join(parts)
 
 
+def _sanitize_filename(filename: str, fallback: str) -> str:
+    """Attachment filenames come straight from the email - untrusted input,
+    not something the mailbox validates. os.path.basename() strips any
+    directory components, which defeats both '../../.bashrc'-style
+    traversal AND an absolute path like '/home/ubuntu/.ssh/authorized_keys':
+    without this, os.path.join(WATCH_FOLDER, filename) would silently
+    discard WATCH_FOLDER entirely for an absolute filename (the same
+    os.path.join gotcha graph.py's move_file_to_processed calls out) and
+    write straight to that path instead."""
+    name = os.path.basename((filename or "").replace("\x00", "")).strip()
+    name = name.lstrip(".")  # never write a hidden dotfile into the watched folder
+    return (name or fallback)[:200]  # stay well under the ~255-byte filesystem limit
+
+
 def _unique_destination(directory: str, filename: str) -> str:
     destination = os.path.join(directory, filename)
     base, ext = os.path.splitext(destination)
@@ -89,16 +103,21 @@ def poll_once() -> int:
             for part in msg.walk():
                 if part.get_content_maintype() == "multipart":
                     continue
-                filename = _decode_header_value(part.get_filename())
-                is_pdf = part.get_content_type() == "application/pdf" or filename.lower().endswith(
+                raw_filename = _decode_header_value(part.get_filename())
+                is_pdf = part.get_content_type() == "application/pdf" or raw_filename.lower().endswith(
                     ".pdf"
                 )
-                if not filename or not is_pdf:
+                if not raw_filename or not is_pdf:
                     continue
                 payload = part.get_payload(decode=True)
                 if not payload:
                     continue
                 found_pdf = True
+                filename = _sanitize_filename(raw_filename, f"email-{uid.decode()}.pdf")
+                if filename != raw_filename:
+                    logger.warning(
+                        "email_watcher: sanitized unsafe attachment name %r -> %r", raw_filename, filename
+                    )
                 logger.info(
                     "email_watcher: uid=%s from=%s subject=%r attachment=%s (%d bytes)",
                     uid.decode(),

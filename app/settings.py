@@ -72,6 +72,23 @@ class Settings:
     IMAP_FOLDER = os.environ.get("IMAP_FOLDER", "INBOX")
     IMAP_POLL_SECONDS = int(os.environ.get("IMAP_POLL_SECONDS", "60"))
 
+    # Item cross-reference fallback: when JDE's voucher-match can't resolve a
+    # supplier's item number, jde_mcp_client calls this JDE MCP server's
+    # jde_po_status tool (via its manual /auth/login route, not the OAuth
+    # flow - that route needs a human in a browser, this one doesn't) to
+    # fetch the PO's lines for a quantity/unit-price fuzzy match. Reuses
+    # JDE_USERNAME/JDE_PASSWORD above - no separate credential needed.
+    #
+    # Talks to the backend directly on localhost, not through nginx's public
+    # https://aoctest.webine3.com/aoc-test-mcp path - that reverse-proxy
+    # rewrites /aoc-test-mcp/mcp incorrectly (nginx's proxy_pass replaces the
+    # whole /aoc-test-mcp prefix with /mcp, so requesting .../aoc-test-mcp/mcp
+    # 404s upstream at /mcp/mcp - the correct public path has no /mcp suffix
+    # at all), and separately gates /aoc-test-mcp/auth/ behind an
+    # X-Client-Secret header this service doesn't have. Both projects run on
+    # the same host, so localhost sidesteps both issues entirely.
+    JDE_MCP_BASE_URL = os.environ.get("JDE_MCP_BASE_URL", "http://127.0.0.1:8006")
+
 
 settings = Settings()
 
