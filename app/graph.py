@@ -2,12 +2,11 @@
 
 Node names mirror the original n8n nodes where practical:
 
-  load_schema             <- Schema Fields1 + Array fields1 + Code in JavaScript3
   read_and_encode_file    <- Code in JavaScript (base64 encode)
-  run_ocr                 <- HTTP Request3 (Document AI) + Edit Fields1
-  sanitize_text           <- Guardrails1
-  call_gemini              <- Gemini Vertex AI1
-  parse_gemini_response    <- Parse Gemini JSON1
+  extract_fields           <- HTTP Request3 (Document AI custom extractor -
+                                OCR + schema field extraction in one call;
+                                replaces the old OCR -> Guardrails1 ->
+                                Gemini Vertex AI1 -> Parse Gemini JSON1 chain)
   build_voucher_payload    <- Code in JavaScript2
   call_voucher_match       <- Voucher Match + Edit Fields2
   move_file_to_processed   <- Execute Command
@@ -16,18 +15,18 @@ Node names mirror the original n8n nodes where practical:
   create_po                <- HTTP Request5
   report_metrics_success   <- HTTP Request6
 
-Two deliberate simplifications versus the n8n graph:
-1. Schema/array field lookups are loaded once from a static YAML config
-   (config/schema_fields.yaml) rather than live Data Table nodes.
-2. The "move file" and "look up account numbers" branches are sequenced
-   rather than run in parallel and joined by a chooseBranch merge, since in
-   the original workflow their only relationship was execution ordering
-   (make sure the file move happens before PO creation), not a data
-   dependency - a plain sequence achieves the same guarantee more simply.
+One deliberate simplification versus the n8n graph: the "move file" and
+"look up account numbers" branches are sequenced rather than run in
+parallel and joined by a chooseBranch merge, since in the original workflow
+their only relationship was execution ordering (make sure the file move
+happens before PO creation), not a data dependency - a plain sequence
+achieves the same guarantee more simply.
 
-Everything else - including the two real parallel branches (schema
-building vs. OCR+sanitize, both joined at call_gemini) and the If2 gate on
-PO receipt records - is preserved.
+Everything else, including the If2 gate on PO receipt records, is
+preserved. config/schema_fields.json is no longer read at graph-run time -
+Document AI's custom extractor has its own fixed schema (configured on the
+processor itself, not per-request) - but schema_builder.account_number_for()
+is still used by attach_account_numbers.
 """
 import json
 import logging
@@ -38,7 +37,7 @@ import uuid
 
 from langgraph.graph import END, START, StateGraph
 
-from . import document_ai, gemini_extract, guardrails, invoice_server, jde_client, jde_mcp_client, schema_builder
+from . import document_ai, invoice_server, jde_client, jde_mcp_client, schema_builder
 from .settings import settings
 from .state import InvoiceState
 
@@ -47,7 +46,7 @@ logger = logging.getLogger("ap_invoice_workflow")
 # Fields too large or too sensitive to dump whole into a log line. Node
 # output logging below truncates the former and redacts the latter -
 # base64_content alone is ~300KB for a typical invoice PDF.
-_TRUNCATE_KEYS = {"base64_content", "ocr_text", "sanitized_text"}
+_TRUNCATE_KEYS = {"base64_content"}
 _REDACT_KEYS = {"password"}
 _MAX_LOG_LEN = 800
 
@@ -156,46 +155,31 @@ def _log_node(name, fn):
     return wrapper
 
 
-def load_schema(state: InvoiceState) -> dict:
-    return {"extraction_schema": schema_builder.build_extraction_schema()}
-
-
 def read_and_encode_file(state: InvoiceState) -> dict:
     base64_content, mime_type = document_ai.encode_file(state["file_path"])
     return {"base64_content": base64_content, "mime_type": mime_type}
 
 
-def run_ocr(state: InvoiceState) -> dict:
+def extract_fields(state: InvoiceState) -> dict:
+    """Document AI's custom extractor does OCR and schema field extraction
+    in one call - see document_ai.parse_entities() for how its structured
+    document.entities are converted into the same canonical field shape the
+    old OCR -> guardrails sanitize -> Gemini extract -> parse JSON chain
+    used to produce, so every downstream node is unaffected.
+
+    parse_error stays in the state contract (route_after_parse still checks
+    it) but this path can't really produce a soft parse failure the way
+    free-text LLM JSON parsing could - a bad call raises and is handled by
+    _log_node's exception path instead, so parse_error is always False here."""
     started = time.monotonic()
     try:
-        text = document_ai.run_ocr(state["base64_content"], state["mime_type"])
+        raw = document_ai.process_document(state["base64_content"], state["mime_type"])
     except Exception as exc:
-        _time_dependency("document_ai", "run_ocr", started, "error", f"{type(exc).__name__}: {exc}")
+        _time_dependency("document_ai", "process_document", started, "error", f"{type(exc).__name__}: {exc}")
         raise
-    timing = _time_dependency("document_ai", "run_ocr", started, "ok")
-    return {"ocr_text": text, "dependency_timings": [timing]}
-
-
-def sanitize_text(state: InvoiceState) -> dict:
-    return {"sanitized_text": guardrails.sanitize(state["ocr_text"])}
-
-
-def call_gemini(state: InvoiceState) -> dict:
-    started = time.monotonic()
-    try:
-        raw = gemini_extract.extract(state["sanitized_text"], state["extraction_schema"])
-    except Exception as exc:
-        _time_dependency("gemini", "extract", started, "error", f"{type(exc).__name__}: {exc}")
-        raise
-    timing = _time_dependency("gemini", "extract", started, "ok")
-    return {"gemini_raw_response": raw, "dependency_timings": [timing]}
-
-
-def parse_gemini_response(state: InvoiceState) -> dict:
-    result = gemini_extract.parse_response(state["gemini_raw_response"])
-    if result.get("parse_error"):
-        return {"parse_error": True, "parse_error_message": result["error"]}
-    return {"extracted": result["output"], "parse_error": False}
+    timing = _time_dependency("document_ai", "process_document", started, "ok")
+    extracted = document_ai.parse_entities(raw)["output"]
+    return {"extracted": extracted, "parse_error": False, "dependency_timings": [timing]}
 
 
 def route_after_parse(state: InvoiceState) -> str:
@@ -303,7 +287,12 @@ def _resolve_item_numbers(state: InvoiceState) -> dict:
             continue
 
         product = products[idx]
-        pdf_item_number = product.get("supplier_item_number") or product.get("item")
+        # Same priority order jde_client.build_payload uses to pick ItemNo -
+        # this needs to be the identifier that was actually sent to (and
+        # rejected by) JDE, not a fallback description field, since it's
+        # both the crossref cache lookup key and the identifier suffix-
+        # matched against PO lines below.
+        pdf_item_number = product.get("item_number") or product.get("supplier_item_number") or product.get("item")
         if not pdf_item_number:
             continue
 
@@ -327,9 +316,9 @@ def _resolve_item_numbers(state: InvoiceState) -> dict:
         except (TypeError, ValueError):
             quantity = unit_price = 0.0
 
-        if not quantity or not unit_price:
+        if not quantity and not unit_price:
             logger.warning(
-                "resolve_item_numbers: no quantity/unit_price to match on for line %s, skipping fuzzy match", seq
+                "resolve_item_numbers: no quantity or unit_price to match on for line %s, skipping fuzzy match", seq
             )
             continue
 
@@ -349,10 +338,20 @@ def _resolve_item_numbers(state: InvoiceState) -> dict:
             else:
                 timings.append(_time_dependency("jde_mcp", "get_po_lines", started, "ok"))
 
-        match = jde_mcp_client.find_matching_po_line(po_lines, quantity, unit_price)
+        # Identifier match first (the PDF's own item number as a suffix of
+        # JDE's SecondItemNumber, corroborated by quantity or cost) - only
+        # falls back to a bare quantity+unit-price coincidence if that finds
+        # nothing, since the identifier is the stronger, OCR-noise-resistant
+        # signal when it's available.
+        match = jde_mcp_client.find_po_line_by_item_number(po_lines, pdf_item_number, quantity, unit_price)
+        match_basis = "item_number"
+        if not match:
+            match = jde_mcp_client.find_matching_po_line(po_lines, quantity, unit_price)
+            match_basis = "quantity_and_unit_price"
+
         if match:
-            suggested = str(match.get("ItemNumber"))
-            logger.info("resolve_item_numbers: fuzzy match for line %s -> %s", seq, suggested)
+            suggested = str(match.get("SecondItemNumber"))
+            logger.info("resolve_item_numbers: %s match for line %s -> %s", match_basis, seq, suggested)
             suggestions.append(
                 {
                     "line_index": idx,
@@ -360,7 +359,7 @@ def _resolve_item_numbers(state: InvoiceState) -> dict:
                     "suggested_jde_item_number": suggested,
                     "quantity": quantity,
                     "unit_price": unit_price,
-                    "match_basis": "quantity_and_unit_price",
+                    "match_basis": match_basis,
                 }
             )
         else:
@@ -411,7 +410,7 @@ def skip_no_receipt(state: InvoiceState) -> dict:
 
 def handle_parse_error(state: InvoiceState) -> dict:
     logger.error(
-        "Gemini output failed to parse for %s: %s", state["file_name"], state.get("parse_error_message")
+        "Field extraction failed to parse for %s: %s", state["file_name"], state.get("parse_error_message")
     )
     invoice_server.report_metrics(
         execution_id=str(uuid.uuid4()),
@@ -427,12 +426,8 @@ def build_graph():
     graph = StateGraph(InvoiceState)
 
     for name, fn in [
-        ("load_schema", load_schema),
         ("read_and_encode_file", read_and_encode_file),
-        ("run_ocr", run_ocr),
-        ("sanitize_text", sanitize_text),
-        ("call_gemini", call_gemini),
-        ("parse_gemini_response", parse_gemini_response),
+        ("extract_fields", extract_fields),
         ("build_voucher_payload", build_voucher_payload),
         ("call_voucher_match", call_voucher_match),
         ("move_file_to_processed", move_file_to_processed),
@@ -445,20 +440,10 @@ def build_graph():
     ]:
         graph.add_node(name, _log_node(name, fn))
 
-    # Fan-out: schema build and OCR+sanitize run in parallel, join at call_gemini.
-    # NOTE: a real AND-join needs the source nodes passed as a single list to
-    # one add_edge call - two separate add_edge(...) calls into the same
-    # target are an OR-trigger (the node runs after the first predecessor to
-    # finish, not after all of them), which fired call_gemini prematurely.
-    graph.add_edge(START, "load_schema")
     graph.add_edge(START, "read_and_encode_file")
-    graph.add_edge("read_and_encode_file", "run_ocr")
-    graph.add_edge("run_ocr", "sanitize_text")
-    graph.add_edge(["load_schema", "sanitize_text"], "call_gemini")
-
-    graph.add_edge("call_gemini", "parse_gemini_response")
+    graph.add_edge("read_and_encode_file", "extract_fields")
     graph.add_conditional_edges(
-        "parse_gemini_response",
+        "extract_fields",
         route_after_parse,
         {
             "build_voucher_payload": "build_voucher_payload",

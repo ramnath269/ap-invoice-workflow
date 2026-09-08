@@ -22,10 +22,12 @@ class Settings:
     WATCH_FOLDER = os.environ.get("WATCH_FOLDER", "/home/node/.n8n-files")
     PROCESSED_SUBFOLDER = os.environ.get("PROCESSED_SUBFOLDER", "processed_files")
 
-    # HTTP Request3 (Google Document AI)
+    # HTTP Request3 (Google Document AI) - custom extractor processor: does
+    # OCR and schema field extraction in one call, replacing the old OCR-only
+    # processor + separate Gemini extraction step.
     GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "678280534943")
     DOCAI_LOCATION = os.environ.get("DOCAI_LOCATION", "us")
-    DOCAI_PROCESSOR_ID = os.environ.get("DOCAI_PROCESSOR_ID", "da343bda4810bc17")
+    DOCAI_PROCESSOR_ID = os.environ.get("DOCAI_PROCESSOR_ID", "cf3e6a8379c1e4c5")
 
     # Gemini Vertex AI1
     VERTEX_PROJECT_ID = os.environ.get("VERTEX_PROJECT_ID", "invoice-ai-platform-496910")

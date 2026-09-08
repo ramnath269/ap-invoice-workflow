@@ -15,23 +15,13 @@ class InvoiceState(TypedDict, total=False):
     file_name: str
     execution_start_ms: float
 
-    # Schema Fields1 + Array fields1 + Code in JavaScript3
-    extraction_schema: dict
-
     # Code in JavaScript (base64 encode)
     base64_content: str
     mime_type: str
 
-    # HTTP Request3 + Edit Fields1
-    ocr_text: str
-
-    # Guardrails1
-    sanitized_text: str
-
-    # Gemini Vertex AI1
-    gemini_raw_response: dict
-
-    # Parse Gemini JSON1
+    # HTTP Request3 (Document AI custom extractor - OCR + field extraction
+    # in one call, replacing the old OCR -> Guardrails1 -> Gemini Vertex
+    # AI1 -> Parse Gemini JSON1 chain)
     extracted: dict
     parse_error: bool
     parse_error_message: str

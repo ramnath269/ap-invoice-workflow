@@ -19,6 +19,7 @@ stale rather than refreshing one.
 import itertools
 import json
 import logging
+import re
 import time
 
 import requests
@@ -28,7 +29,10 @@ from .settings import settings
 logger = logging.getLogger("ap_invoice_workflow")
 
 _MATCH_TOLERANCE = 0.01
+_COST_CORROBORATION_TOLERANCE = 0.15  # 15% - wide enough to survive a PO/invoice discount program
+_EXTENDED_COST_SCALE = 100
 _TOKEN_LIFETIME_SECONDS = 10 * 60  # real TTL is ~15 min; refresh before that
+_ITEM_NUMBER_NORMALIZE_RE = re.compile(r"[^A-Z0-9]")
 
 _token: str | None = None
 _token_expiry: float = 0.0
@@ -168,11 +172,13 @@ def get_po_lines(order_number, order_type: str) -> list[dict]:
     return lines or []
 
 
-def find_matching_po_line(po_lines: list[dict], quantity: float, unit_price: float) -> dict | None:
-    """Fuzzy-matches a PDF line item to exactly one PO line by quantity and
-    unit price (derived as ExtendedCost / OrderedQuantity, since jde_po_status
-    doesn't return a unit-price column directly). Returns None on zero or
-    ambiguous (multiple) matches - only a confident, single match counts.
+def _normalize_item_number(value: str) -> str:
+    return _ITEM_NUMBER_NORMALIZE_RE.sub("", (value or "").upper())
+
+
+def _line_unit_price(line: dict) -> float | None:
+    """Derived as ExtendedCost / OrderedQuantity, since jde_po_status doesn't
+    return a unit-price column directly.
 
     jde_po_status's query selects PDECST (Extended Cost) raw from F4311,
     which JDE stores scaled x100 - confirmed empirically against a real
@@ -180,14 +186,77 @@ def find_matching_po_line(po_lines: list[dict], quantity: float, unit_price: flo
     -> 493.0 unscaled vs the PDF's real unit_price of 4.93; /100 gives
     exactly 4.93). Comparing the raw scaled value against a real-dollar
     unit_price would silently fail to match almost everything."""
-    _EXTENDED_COST_SCALE = 100
+    ordered_qty = line.get("OrderedQuantity") or 0
+    if not ordered_qty:
+        return None
+    return (line.get("ExtendedCost") or 0) / _EXTENDED_COST_SCALE / ordered_qty
+
+
+def find_po_line_by_item_number(
+    po_lines: list[dict], pdf_item_number: str, quantity: float, unit_price: float
+) -> dict | None:
+    """Matches a PDF line item to a PO line by identifier first: the PDF's
+    own item/supplier item number, normalized (uppercase, separators
+    stripped), compared as a suffix of SecondItemNumber - JDE's catalog
+    codes are consistently formatted as a brand/prefix plus the raw
+    manufacturer part number (e.g. "35PS" -> "D0735PS", "16-PB-DS" ->
+    "BLAS16PBDS").
+
+    A bare suffix hit isn't trusted alone: it's only treated as confident if
+    that same line's quantity or unit cost also corroborates it (loose
+    tolerance on cost, since a discount/rebate program routinely puts the
+    PO's cost several percent below the invoice's stated unit price - the
+    identifier match already carries most of the confidence here, the
+    quantity/cost check is just a sanity guard against a coincidental
+    suffix). Returns None on zero, ambiguous, or uncorroborated matches."""
+    needle = _normalize_item_number(pdf_item_number)
+    if not needle:
+        return None
+
+    candidates = [
+        line for line in po_lines
+        if _normalize_item_number(str(line.get("SecondItemNumber") or "")).endswith(needle)
+    ]
+    if not candidates:
+        return None
+    if len(candidates) > 1:
+        logger.warning(
+            "jde_mcp_client.find_po_line_by_item_number: %d ambiguous suffix matches for item_number=%s",
+            len(candidates), pdf_item_number,
+        )
+        return None
+
+    line = candidates[0]
+    ordered_qty = line.get("OrderedQuantity") or 0
+    line_unit_price = _line_unit_price(line)
+
+    quantity_matches = bool(ordered_qty) and abs(ordered_qty - quantity) <= _MATCH_TOLERANCE
+    cost_matches = (
+        line_unit_price is not None
+        and unit_price
+        and abs(line_unit_price - unit_price) / unit_price <= _COST_CORROBORATION_TOLERANCE
+    )
+    if quantity_matches or cost_matches:
+        return line
+
+    logger.warning(
+        "jde_mcp_client.find_po_line_by_item_number: suffix match for item_number=%s -> %s found, but neither "
+        "quantity (%s vs PO %s) nor unit cost (%s vs PO %s) corroborate it - discarding",
+        pdf_item_number, line.get("SecondItemNumber"), quantity, ordered_qty, unit_price, line_unit_price,
+    )
+    return None
+
+
+def find_matching_po_line(po_lines: list[dict], quantity: float, unit_price: float) -> dict | None:
+    """Fuzzy-matches a PDF line item to exactly one PO line by quantity and
+    unit price alone (no identifier available/matched). Returns None on zero
+    or ambiguous (multiple) matches - only a confident, single match counts."""
     matches = []
     for line in po_lines:
         ordered_qty = line.get("OrderedQuantity") or 0
-        extended_cost = (line.get("ExtendedCost") or 0) / _EXTENDED_COST_SCALE
-        if not ordered_qty:
+        line_unit_price = _line_unit_price(line)
+        if line_unit_price is None:
             continue
-        line_unit_price = extended_cost / ordered_qty
         if abs(ordered_qty - quantity) <= _MATCH_TOLERANCE and abs(line_unit_price - unit_price) <= _MATCH_TOLERANCE:
             matches.append(line)
 

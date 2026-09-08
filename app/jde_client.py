@@ -60,6 +60,12 @@ def voucher_match(payload: dict) -> dict:
         payload.get("VendorInvoiceNo"),
     )
     resp = requests.post(settings.JDE_ORCHESTRATOR_URL, json=payload, timeout=60)
+    if not resp.ok:
+        logger.error(
+            "jde_client.voucher_match: HTTP %d response body=%s",
+            resp.status_code,
+            resp.text,
+        )
     resp.raise_for_status()
     data = resp.json()
     logger.info(

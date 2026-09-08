@@ -38,7 +38,7 @@ RULES:
 16. If the value of purchase order contains additional suffixes, revisions, sequence identifiers, line-item indicators, or other segments separated by special characters (such as -, /, _, ., or spaces), return only the primary/base purchase order number that uniquely identifies the order in the source system.
 STRING ESCAPING CONSTRAINT: All extracted text fields must be safe for automated parsing.
 17. The table contains separate columns for MFR (Manufacturer Code) and Item #. Even if they appear together in the raw text, extract MFR into mfr_code and the item identifier into item_number. Do not concatenate them.
-
+18. Consider Control number as Order number in case order number is not present in the document.
 Here is the document:
 """
 
@@ -54,7 +54,7 @@ def extract(document_text: str, response_schema: dict) -> dict:
         "generationConfig": {
             "temperature": 0,
             "responseMimeType": "application/json",
-            "maxOutputTokens": 8192,
+            "maxOutputTokens": 50000,
             "responseSchema": response_schema,
         },
     }
