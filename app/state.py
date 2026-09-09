@@ -31,6 +31,7 @@ class InvoiceState(TypedDict, total=False):
     voucher_match_response: dict
     erp_fields: dict
     po_receipt_valid: bool
+    voucher_match_error: str | None
 
     # Execute Command (mv to processed_files)
     processed_file_path: str

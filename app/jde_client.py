@@ -18,9 +18,7 @@ def build_payload(extracted: dict) -> dict:
     products = extracted.get("products") or []
     detail = [
         {
-            "ItemNo": str(
-                p.get("item_number") or p.get("supplier_item_number") or p.get("item") or ""
-            ),
+            "ItemNo": str(p.get("item") or p.get("supplier_item_number") or ""),
             "SequenceNumber": i + 1,
             "Quantity": p.get("quantity"),
             "UOM": p.get("unit_of_measure"),
@@ -82,3 +80,32 @@ def has_receipt_records(voucher_match_response: dict) -> bool:
     valid = bool(records and records > 0)
     logger.info("jde_client.has_receipt_records: records=%s valid=%s", records, valid)
     return valid
+
+
+ERROR_DUPLICATE_INVOICE = "duplicate_invoice"
+ERROR_ORDER_NOT_FOUND = "order_not_found"
+
+# Substrings of JDE's ErrorMessage that identify each exception case. JDE
+# reuses the same ErrorCode ("1") for both, so ErrorMessage text is the only
+# reliable discriminator - confirmed against live responses:
+#   ErrorCode=1 ErrorMessage="Order information not found"
+#   ErrorCode=1 ErrorMessage="Invoice already exists with following details"
+_ERROR_MESSAGE_PATTERNS = {
+    ERROR_DUPLICATE_INVOICE: "invoice already exists",
+    ERROR_ORDER_NOT_FOUND: "order information not found",
+}
+
+
+def classify_voucher_match_error(voucher_match_response: dict) -> str | None:
+    """Maps JDE's ErrorMessage to one of the known exception cases, or None
+    if the response carries no recognized error (e.g. a clean receipt-record
+    lookup, or a genuinely empty receipt file with no ErrorMessage at all -
+    that's handled separately by has_receipt_records, not as an exception)."""
+    message = (voucher_match_response.get("ErrorMessage") or "").strip().lower()
+    if not message:
+        return None
+    for reason, pattern in _ERROR_MESSAGE_PATTERNS.items():
+        if pattern in message:
+            return reason
+    logger.warning("jde_client.classify_voucher_match_error: unrecognized ErrorMessage=%r", message)
+    return None

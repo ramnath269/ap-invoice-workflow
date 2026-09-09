@@ -12,6 +12,7 @@ from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
 from .graph import build_graph
+from .logging_config import configure_logging
 from .settings import settings, validate
 
 logger = logging.getLogger("ap_invoice_workflow")
@@ -55,7 +56,7 @@ class _NewFileHandler(FileSystemEventHandler):
 
 
 def watch() -> None:
-    logging.basicConfig(level=logging.INFO)
+    configure_logging("watcher")
     validate()
 
     os.makedirs(os.path.join(settings.WATCH_FOLDER, settings.PROCESSED_SUBFOLDER), exist_ok=True)

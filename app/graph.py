@@ -170,13 +170,39 @@ def extract_fields(state: InvoiceState) -> dict:
     parse_error stays in the state contract (route_after_parse still checks
     it) but this path can't really produce a soft parse failure the way
     free-text LLM JSON parsing could - a bad call raises and is handled by
-    _log_node's exception path instead, so parse_error is always False here."""
+    _log_node's exception path instead, so parse_error is always False here.
+
+    The processor's foundation-model backend isn't fully deterministic call
+    to call (see document_ai.find_extraction_issues' docstring for the
+    evidence), so a response missing a required field or holding low
+    confidence on one gets exactly one retry before we accept whatever the
+    second call returns - better odds of a clean extraction without an
+    unbounded retry loop against a live API."""
     started = time.monotonic()
     try:
         raw = document_ai.process_document(state["base64_content"], state["mime_type"])
     except Exception as exc:
         _time_dependency("document_ai", "process_document", started, "error", f"{type(exc).__name__}: {exc}")
         raise
+
+    issues = document_ai.find_extraction_issues(raw)
+    if issues:
+        logger.warning(
+            "extract_fields: retrying document_ai.process_document once - %d issue(s) found: %s",
+            len(issues), "; ".join(issues),
+        )
+        try:
+            raw = document_ai.process_document(state["base64_content"], state["mime_type"])
+        except Exception as exc:
+            _time_dependency("document_ai", "process_document", started, "error", f"{type(exc).__name__}: {exc}")
+            raise
+        retry_issues = document_ai.find_extraction_issues(raw)
+        if retry_issues:
+            logger.warning(
+                "extract_fields: retry still has %d issue(s), proceeding anyway (retry budget exhausted): %s",
+                len(retry_issues), "; ".join(retry_issues),
+            )
+
     timing = _time_dependency("document_ai", "process_document", started, "ok")
     extracted = document_ai.parse_entities(raw)["output"]
     return {"extracted": extracted, "parse_error": False, "dependency_timings": [timing]}
@@ -204,14 +230,24 @@ def call_voucher_match(state: InvoiceState) -> dict:
         "voucher_match_response": response,
         "erp_fields": response,
         "po_receipt_valid": jde_client.has_receipt_records(response),
+        "voucher_match_error": jde_client.classify_voucher_match_error(response),
         "dependency_timings": [timing],
     }
 
 
 def route_after_voucher_match(state: InvoiceState) -> str:
-    route = "move_file_to_processed" if state.get("po_receipt_valid") else "skip_no_receipt"
+    error = state.get("voucher_match_error")
+    if error == jde_client.ERROR_DUPLICATE_INVOICE:
+        route = "handle_duplicate_invoice"
+    elif error == jde_client.ERROR_ORDER_NOT_FOUND:
+        route = "handle_order_not_found"
+    elif state.get("po_receipt_valid"):
+        route = "move_file_to_processed"
+    else:
+        route = "skip_no_receipt"
     logger.info(
-        ">> ROUTE   route_after_voucher_match: po_receipt_valid=%s => %s",
+        ">> ROUTE   route_after_voucher_match: voucher_match_error=%s po_receipt_valid=%s => %s",
+        error,
         state.get("po_receipt_valid"),
         route,
     )
@@ -292,7 +328,7 @@ def _resolve_item_numbers(state: InvoiceState) -> dict:
         # rejected by) JDE, not a fallback description field, since it's
         # both the crossref cache lookup key and the identifier suffix-
         # matched against PO lines below.
-        pdf_item_number = product.get("item_number") or product.get("supplier_item_number") or product.get("item")
+        pdf_item_number = product.get("item") or product.get("supplier_item_number")
         if not pdf_item_number:
             continue
 
@@ -307,7 +343,7 @@ def _resolve_item_numbers(state: InvoiceState) -> dict:
             logger.info(
                 "resolve_item_numbers: cache hit, supplier=%s item=%s -> %s", supplier_number, pdf_item_number, assigned
             )
-            product["item_number"] = assigned
+            product["item"] = assigned
             continue
 
         try:
@@ -408,6 +444,48 @@ def skip_no_receipt(state: InvoiceState) -> dict:
     return {"status": "skipped_no_receipt"}
 
 
+def _handle_voucher_match_exception(state: InvoiceState, exception_reason: str) -> dict:
+    """Common body for the two recognized JDE voucher-match errors: unlike
+    skip_no_receipt (a legitimate "nothing's been received yet" outcome),
+    these are exceptions - the invoice itself gets persisted (via
+    invoice_server.record_exception, which dedupes so a resubmitted invoice
+    doesn't pile up repeat records) so it shows up for review instead of
+    only leaving a trace in workflow metrics."""
+    response = state.get("voucher_match_response") or {}
+    error_message = response.get("ErrorMessage") or ""
+    logger.error(
+        "%s for %s: OrderNumber=%s VendorInvoiceNo=%s ErrorMessage=%s",
+        exception_reason,
+        state["file_name"],
+        response.get("OrderNumber"),
+        response.get("VendorInvoiceNo"),
+        error_message,
+    )
+    invoice_server.record_exception(
+        pdf_fields=state["extracted"],
+        erp_fields=response,
+        file_path=state["file_path"],
+        exception_reason=exception_reason,
+        error_message=error_message,
+    )
+    invoice_server.report_metrics(
+        execution_id=str(uuid.uuid4()),
+        status=exception_reason,
+        execution_start_ms=state["execution_start_ms"],
+        error=error_message,
+        dependency_timings=state.get("dependency_timings"),
+    )
+    return {"status": exception_reason}
+
+
+def handle_duplicate_invoice(state: InvoiceState) -> dict:
+    return _handle_voucher_match_exception(state, jde_client.ERROR_DUPLICATE_INVOICE)
+
+
+def handle_order_not_found(state: InvoiceState) -> dict:
+    return _handle_voucher_match_exception(state, jde_client.ERROR_ORDER_NOT_FOUND)
+
+
 def handle_parse_error(state: InvoiceState) -> dict:
     logger.error(
         "Field extraction failed to parse for %s: %s", state["file_name"], state.get("parse_error_message")
@@ -436,6 +514,8 @@ def build_graph():
         ("create_po", create_po),
         ("report_metrics_success", report_metrics_success),
         ("skip_no_receipt", skip_no_receipt),
+        ("handle_duplicate_invoice", handle_duplicate_invoice),
+        ("handle_order_not_found", handle_order_not_found),
         ("handle_parse_error", handle_parse_error),
     ]:
         graph.add_node(name, _log_node(name, fn))
@@ -458,6 +538,8 @@ def build_graph():
         {
             "move_file_to_processed": "move_file_to_processed",
             "skip_no_receipt": "skip_no_receipt",
+            "handle_duplicate_invoice": "handle_duplicate_invoice",
+            "handle_order_not_found": "handle_order_not_found",
         },
     )
 
@@ -468,6 +550,8 @@ def build_graph():
 
     graph.add_edge("report_metrics_success", END)
     graph.add_edge("skip_no_receipt", END)
+    graph.add_edge("handle_duplicate_invoice", END)
+    graph.add_edge("handle_order_not_found", END)
     graph.add_edge("handle_parse_error", END)
 
     return graph.compile()

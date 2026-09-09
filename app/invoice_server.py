@@ -54,6 +54,44 @@ def create_po(
     return data
 
 
+def record_exception(
+    pdf_fields: dict, erp_fields: dict, file_path: str, exception_reason: str, error_message: str
+) -> dict:
+    """Persists an invoice that failed voucher-match with a recognized JDE
+    error (duplicate invoice / order not found) instead of silently dropping
+    it - only report_metrics used to be called for these, so the invoice
+    itself never showed up anywhere for a person to review.
+
+    invoice-server dedupes on (OrderNumber, VendorInvoiceNo, exception_reason)
+    before inserting, so resubmitting the same failing invoice repeatedly
+    (e.g. a folder watcher rescan) doesn't pile up duplicate exception
+    records - see POST /create-po-exception.
+    """
+    legacy_file_path = f"/processed_files/{os.path.basename(file_path)}"
+    logger.info(
+        "invoice_server.record_exception: POST %s/create-po-exception reason=%s order=%s vendor_invoice=%s",
+        settings.INVOICE_SERVER_BASE_URL,
+        exception_reason,
+        erp_fields.get("OrderNumber"),
+        erp_fields.get("VendorInvoiceNo"),
+    )
+    resp = requests.post(
+        f"{settings.INVOICE_SERVER_BASE_URL}/create-po-exception",
+        json={
+            "pdf_fields": pdf_fields,
+            "erp_fields": erp_fields,
+            "file_path": legacy_file_path,
+            "exception_reason": exception_reason,
+            "error_message": error_message,
+        },
+        timeout=60,
+    )
+    resp.raise_for_status()
+    data = resp.json() if resp.content else {}
+    logger.info("invoice_server.record_exception: response=%s", data)
+    return data
+
+
 def lookup_item_crossref(supplier_number, item_number: str) -> str | None:
     """Checks invoice-server's item_crossref cache for a previously
     user-confirmed (supplier_number, item_number) -> assigned_item_number

@@ -91,6 +91,14 @@ class Settings:
     # the same host, so localhost sidesteps both issues entirely.
     JDE_MCP_BASE_URL = os.environ.get("JDE_MCP_BASE_URL", "http://127.0.0.1:8006")
 
+    # Rotating log file for the long-running watchers (main.py / email_main.py)
+    # - see app/logging_config.py. A systemd deployment already gets logs via
+    # journald and doesn't need this; it's for grepping directly and for runs
+    # outside systemd.
+    LOG_DIR = os.environ.get("LOG_DIR", os.path.join(os.path.dirname(__file__), "..", "logs"))
+    LOG_MAX_BYTES = int(os.environ.get("LOG_MAX_BYTES", str(10 * 1024 * 1024)))  # 10 MB
+    LOG_BACKUP_COUNT = int(os.environ.get("LOG_BACKUP_COUNT", "5"))
+
 
 settings = Settings()
 

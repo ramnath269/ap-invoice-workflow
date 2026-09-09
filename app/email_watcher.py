@@ -17,6 +17,7 @@ import os
 import time
 from email.header import decode_header
 
+from .logging_config import configure_logging
 from .settings import settings, validate_imap
 
 logger = logging.getLogger("ap_invoice_workflow")
@@ -147,7 +148,7 @@ def poll_once() -> int:
 
 
 def watch() -> None:
-    logging.basicConfig(level=logging.INFO)
+    configure_logging("email_watcher")
     validate_imap()
     logger.info(
         "email_watcher: polling %s@%s folder=%s every %ds",
