@@ -15,8 +15,7 @@ IMAP_REQUIRED_VARS = ["IMAP_HOST", "IMAP_USERNAME", "IMAP_PASSWORD"]
 
 
 class Settings:
-    WORKFLOW_ID = "ftp-based-wf"
-    WORKFLOW_NAME = "FTP based WF"
+    WORKFLOW_NAME = "ap-invoice-workflow"
 
     # Local File Trigger1
     WATCH_FOLDER = os.environ.get("WATCH_FOLDER", "/home/node/.n8n-files")
@@ -90,6 +89,23 @@ class Settings:
     # X-Client-Secret header this service doesn't have. Both projects run on
     # the same host, so localhost sidesteps both issues entirely.
     JDE_MCP_BASE_URL = os.environ.get("JDE_MCP_BASE_URL", "http://127.0.0.1:8006")
+
+    # Reprocess API (app/reprocess_api.py, run in a background thread by
+    # app/watcher.py) - lets server/index.js retry a duplicate-invoice-number
+    # correction against JDE without re-running OCR. Unlike JDE_MCP_BASE_URL
+    # above, the caller here (server/index.js) runs inside a Docker container
+    # (see docker-compose.yml's "server" service), not on this host's own
+    # loopback - 127.0.0.1 in that container is the container's own network
+    # namespace, not this host's, so binding there would make this
+    # unreachable. Bind 0.0.0.0 instead and let Node reach it via
+    # host.docker.internal (docker-compose.yml already sets
+    # extra_hosts: host.docker.internal:host-gateway for that service). This
+    # port is never published in docker-compose.yml or routed through nginx,
+    # so it isn't reachable from outside this host either way - a host
+    # firewall rule scoping it to the app-network bridge subnet is the
+    # defense-in-depth layer for "not reachable from other local processes."
+    REPROCESS_API_HOST = os.environ.get("REPROCESS_API_HOST", "0.0.0.0")
+    REPROCESS_API_PORT = int(os.environ.get("REPROCESS_API_PORT", "8077"))
 
     # Rotating log file for the long-running watchers (main.py / email_main.py)
     # - see app/logging_config.py. A systemd deployment already gets logs via

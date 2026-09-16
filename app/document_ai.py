@@ -173,6 +173,21 @@ def find_extraction_issues(raw_response: dict) -> list[str]:
     return issues
 
 
+def looks_like_invoice(raw_response: dict) -> bool:
+    """True unless Document AI found none of the three required top-level
+    fields (_REQUIRED_TOP_LEVEL_TYPES) at all - not merely low-confidence on
+    one, since a present-but-shaky field is still much stronger evidence this
+    is a real invoice than a signature block, logo, or T&Cs/W9 document
+    rendered as its own PDF, where Document AI typically detects none of
+    them. Deliberately conservative (any one present is enough) so a genuine
+    invoice with one troublesome field is never misrouted - see graph.py's
+    extract_fields, which uses this (not find_extraction_issues' full,
+    stricter list) to decide whether to stop before ever calling JDE."""
+    entities = raw_response.get("document", {}).get("entities", [])
+    present = {e.get("type") for e in entities if e.get("type") != "products"}
+    return bool(present & _REQUIRED_TOP_LEVEL_TYPES)
+
+
 def parse_entities(raw_response: dict) -> dict:
     """Converts this processor's structured document.entities into the same
     canonical field shape gemini_extract.parse_response()'s {"output": ...}

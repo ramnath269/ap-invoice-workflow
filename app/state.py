@@ -25,6 +25,12 @@ class InvoiceState(TypedDict, total=False):
     extracted: dict
     parse_error: bool
     parse_error_message: str
+    # document_ai.looks_like_invoice() on the (possibly retried) extraction
+    # response - True when none of invoice_number/invoice_date/
+    # total_amount_due were found at all, e.g. a signature/logo or T&Cs/W9
+    # attachment that slipped past email_watcher's PDF-only filter. Routes to
+    # handle_not_an_invoice instead of ever calling JDE.
+    not_an_invoice: bool
 
     # Code in JavaScript2 + Voucher Match + Edit Fields2
     voucher_match_payload: dict

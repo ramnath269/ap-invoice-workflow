@@ -204,13 +204,30 @@ def extract_fields(state: InvoiceState) -> dict:
             )
 
     timing = _time_dependency("document_ai", "process_document", started, "ok")
+    not_an_invoice = not document_ai.looks_like_invoice(raw)
     extracted = document_ai.parse_entities(raw)["output"]
-    return {"extracted": extracted, "parse_error": False, "dependency_timings": [timing]}
+    return {
+        "extracted": extracted,
+        "parse_error": False,
+        "not_an_invoice": not_an_invoice,
+        "dependency_timings": [timing],
+    }
 
 
 def route_after_parse(state: InvoiceState) -> str:
-    route = "handle_parse_error" if state.get("parse_error") else "build_voucher_payload"
-    logger.info(">> ROUTE   route_after_parse: parse_error=%s => %s", state.get("parse_error"), route)
+    missing_order_number = not (state.get("extracted") or {}).get("purchase_order")
+    if state.get("parse_error"):
+        route = "handle_parse_error"
+    elif state.get("not_an_invoice"):
+        route = "handle_not_an_invoice"
+    elif missing_order_number:
+        route = "handle_missing_order_number"
+    else:
+        route = "build_voucher_payload"
+    logger.info(
+        ">> ROUTE   route_after_parse: parse_error=%s not_an_invoice=%s missing_order_number=%s => %s",
+        state.get("parse_error"), state.get("not_an_invoice"), missing_order_number, route,
+    )
     return route
 
 
@@ -254,14 +271,19 @@ def route_after_voucher_match(state: InvoiceState) -> str:
     return route
 
 
-def move_file_to_processed(state: InvoiceState) -> dict:
+def _move_to_processed(file_path: str, file_name: str) -> str:
     # os.path.join discards WATCH_FOLDER if PROCESSED_SUBFOLDER is itself
     # absolute, which is fine - it just means "processed files go here"
     # regardless of where they were watched from.
     processed_dir = os.path.join(settings.WATCH_FOLDER, settings.PROCESSED_SUBFOLDER)
     os.makedirs(processed_dir, exist_ok=True)
-    destination = os.path.join(processed_dir, state["file_name"])
-    shutil.move(state["file_path"], destination)
+    destination = os.path.join(processed_dir, file_name)
+    shutil.move(file_path, destination)
+    return destination
+
+
+def move_file_to_processed(state: InvoiceState) -> dict:
+    destination = _move_to_processed(state["file_path"], state["file_name"])
     return {"processed_file_path": destination}
 
 
@@ -444,27 +466,24 @@ def skip_no_receipt(state: InvoiceState) -> dict:
     return {"status": "skipped_no_receipt"}
 
 
-def _handle_voucher_match_exception(state: InvoiceState, exception_reason: str) -> dict:
-    """Common body for the two recognized JDE voucher-match errors: unlike
-    skip_no_receipt (a legitimate "nothing's been received yet" outcome),
-    these are exceptions - the invoice itself gets persisted (via
-    invoice_server.record_exception, which dedupes so a resubmitted invoice
-    doesn't pile up repeat records) so it shows up for review instead of
-    only leaving a trace in workflow metrics."""
-    response = state.get("voucher_match_response") or {}
-    error_message = response.get("ErrorMessage") or ""
-    logger.error(
-        "%s for %s: OrderNumber=%s VendorInvoiceNo=%s ErrorMessage=%s",
-        exception_reason,
-        state["file_name"],
-        response.get("OrderNumber"),
-        response.get("VendorInvoiceNo"),
-        error_message,
-    )
+def _record_exception_outcome(
+    state: InvoiceState, exception_reason: str, erp_fields: dict, error_message: str
+) -> dict:
+    """Shared tail for every exception outcome (duplicate_invoice,
+    order_not_found, not_an_invoice): moves the PDF to the processed folder
+    itself - routing to any of these bypasses the move_file_to_processed node
+    entirely, so without this, invoice_server.record_exception's file_path
+    would point at a file that was never moved out of the watch folder, and
+    the dashboard's /file/:id lookup (which only looks in the processed
+    folder) would 404/500 on it - then persists the exception (dedupes
+    server-side so a resubmitted invoice doesn't pile up repeat records) and
+    reports metrics, so it shows up for review instead of only leaving a
+    trace in workflow metrics."""
+    processed_file_path = _move_to_processed(state["file_path"], state["file_name"])
     invoice_server.record_exception(
         pdf_fields=state["extracted"],
-        erp_fields=response,
-        file_path=state["file_path"],
+        erp_fields=erp_fields,
+        file_path=processed_file_path,
         exception_reason=exception_reason,
         error_message=error_message,
     )
@@ -478,12 +497,70 @@ def _handle_voucher_match_exception(state: InvoiceState, exception_reason: str) 
     return {"status": exception_reason}
 
 
+def _handle_voucher_match_exception(state: InvoiceState, exception_reason: str) -> dict:
+    """Common body for the two recognized JDE voucher-match errors: unlike
+    skip_no_receipt (a legitimate "nothing's been received yet" outcome),
+    these are exceptions that get persisted for review."""
+    response = state.get("voucher_match_response") or {}
+    error_message = response.get("ErrorMessage") or ""
+    logger.error(
+        "%s for %s: OrderNumber=%s VendorInvoiceNo=%s ErrorMessage=%s",
+        exception_reason,
+        state["file_name"],
+        response.get("OrderNumber"),
+        response.get("VendorInvoiceNo"),
+        error_message,
+    )
+    return _record_exception_outcome(state, exception_reason, response, error_message)
+
+
 def handle_duplicate_invoice(state: InvoiceState) -> dict:
     return _handle_voucher_match_exception(state, jde_client.ERROR_DUPLICATE_INVOICE)
 
 
 def handle_order_not_found(state: InvoiceState) -> dict:
     return _handle_voucher_match_exception(state, jde_client.ERROR_ORDER_NOT_FOUND)
+
+
+def handle_not_an_invoice(state: InvoiceState) -> dict:
+    """Routed here by route_after_parse when extract_fields's Document AI
+    call found none of the required top-level fields (document_ai.
+    looks_like_invoice) even after its one retry - e.g. a signature/logo or
+    T&Cs/W9 document rendered as its own PDF that slipped past
+    email_watcher's PDF-only attachment filter. Never got far enough to call
+    JDE, so there's no OrderNumber/VendorInvoiceNo to key the exception
+    dedupe on (see invoice_server.record_exception) - file_name stands in for
+    VendorInvoiceNo instead, which is enough to keep two different bad files
+    from colliding into the same dashboard row without pretending either one
+    is a real ERP invoice number."""
+    error_message = (
+        "Document AI could not find an invoice number, invoice date, or "
+        "total amount on this document - it may not be an invoice."
+    )
+    logger.error("not_an_invoice for %s: %s", state["file_name"], error_message)
+    return _record_exception_outcome(
+        state, "not_an_invoice", {"VendorInvoiceNo": state["file_name"]}, error_message
+    )
+
+
+def handle_missing_order_number(state: InvoiceState) -> dict:
+    """Routed here by route_after_parse when Document AI found an invoice
+    (route_after_parse's not_an_invoice check already passed) but no
+    purchase_order field on it. Caught before build_voucher_payload/
+    call_voucher_match rather than letting it through: jde_client.
+    build_payload would otherwise send JDE an empty OrderNumber, and JDE
+    reports that back as "order information not found" - the same error
+    message a real, populated-but-unknown PO number produces (see
+    jde_client.classify_voucher_match_error) - which would make a plainly
+    missing PO number indistinguishable from a mistyped one on the
+    dashboard."""
+    extracted = state.get("extracted") or {}
+    vendor_invoice_no = extracted.get("invoice_number") or state["file_name"]
+    error_message = "No purchase order / order number was found on this invoice."
+    logger.error("missing_order_number for %s: %s", state["file_name"], error_message)
+    return _record_exception_outcome(
+        state, "missing_order_number", {"VendorInvoiceNo": vendor_invoice_no}, error_message
+    )
 
 
 def handle_parse_error(state: InvoiceState) -> dict:
@@ -516,6 +593,8 @@ def build_graph():
         ("skip_no_receipt", skip_no_receipt),
         ("handle_duplicate_invoice", handle_duplicate_invoice),
         ("handle_order_not_found", handle_order_not_found),
+        ("handle_not_an_invoice", handle_not_an_invoice),
+        ("handle_missing_order_number", handle_missing_order_number),
         ("handle_parse_error", handle_parse_error),
     ]:
         graph.add_node(name, _log_node(name, fn))
@@ -527,6 +606,8 @@ def build_graph():
         route_after_parse,
         {
             "build_voucher_payload": "build_voucher_payload",
+            "handle_not_an_invoice": "handle_not_an_invoice",
+            "handle_missing_order_number": "handle_missing_order_number",
             "handle_parse_error": "handle_parse_error",
         },
     )
@@ -552,6 +633,8 @@ def build_graph():
     graph.add_edge("skip_no_receipt", END)
     graph.add_edge("handle_duplicate_invoice", END)
     graph.add_edge("handle_order_not_found", END)
+    graph.add_edge("handle_not_an_invoice", END)
+    graph.add_edge("handle_missing_order_number", END)
     graph.add_edge("handle_parse_error", END)
 
     return graph.compile()

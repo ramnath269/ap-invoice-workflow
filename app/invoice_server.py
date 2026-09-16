@@ -92,6 +92,72 @@ def record_exception(
     return data
 
 
+def get_po(record_id: str) -> dict:
+    """Fetches a purchase_order/exception doc by CouchDB _id - used by
+    reprocess_api to load the pdf_fields/erp_fields/exception_reason of a
+    duplicate-invoice exception before retrying voucher-match."""
+    logger.info("invoice_server.get_po: GET %s/po/%s", settings.INVOICE_SERVER_BASE_URL, record_id)
+    resp = requests.get(f"{settings.INVOICE_SERVER_BASE_URL}/po/{record_id}", timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def update_po(
+    record_id: str,
+    pdf_fields: dict,
+    erp_fields: dict,
+    exception_reason: str | None,
+    error_message: str | None,
+    item_suggestions: list[dict] | None = None,
+) -> dict:
+    """Overwrites an existing doc's pdf_fields/erp_fields/exception fields in
+    place (POST /update-po/:id), used by reprocess_api to write back a
+    voucher-match retry's outcome onto the SAME record instead of inserting
+    a new one via create_po/record_exception.
+
+    exception_reason must always be passed explicitly (None to clear it on a
+    clean success, or a string to record a new/different exception) - the
+    server only touches exception_reason/error_message when the key is
+    present in the request body at all, so it can tell "clear it" apart from
+    "the caller doesn't know about this field" (existing callers of
+    /update-po/:id, e.g. the dashboard's plain status updates, never send it
+    and must leave it untouched).
+
+    item_suggestions is the opposite: omit it (leave the default None) unless
+    a fresh resolve_item_numbers pass actually ran and should replace
+    whatever suggestions were on the doc - passing None here means the
+    "item_suggestions" key never lands in the request body at all, versus
+    exception_reason's explicit None which the server reads as "clear it."
+    Sending a bare `None`/`null` for item_suggestions instead of omitting the
+    key would make the server wipe out suggestions a person may have already
+    confirmed, on a request that never meant to touch them.
+    """
+    logger.info(
+        "invoice_server.update_po: POST %s/update-po/%s exception_reason=%s item_suggestions=%s",
+        settings.INVOICE_SERVER_BASE_URL,
+        record_id,
+        exception_reason,
+        "omitted" if item_suggestions is None else len(item_suggestions),
+    )
+    payload = {
+        "pdf_fields": pdf_fields,
+        "erp_fields": erp_fields,
+        "exception_reason": exception_reason,
+        "error_message": error_message,
+    }
+    if item_suggestions is not None:
+        payload["item_suggestions"] = item_suggestions
+    resp = requests.post(
+        f"{settings.INVOICE_SERVER_BASE_URL}/update-po/{record_id}",
+        json=payload,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json() if resp.content else {}
+    logger.info("invoice_server.update_po: response=%s", data)
+    return data
+
+
 def lookup_item_crossref(supplier_number, item_number: str) -> str | None:
     """Checks invoice-server's item_crossref cache for a previously
     user-confirmed (supplier_number, item_number) -> assigned_item_number
@@ -141,7 +207,6 @@ def report_metrics(
     execution_time_ms = int(time.time() * 1000) - int(execution_start_ms)
     payload = {
         "workflow_name": settings.WORKFLOW_NAME,
-        "workflow_id": settings.WORKFLOW_ID,
         "execution_id": execution_id,
         "status": status,
         "execution_time_ms": execution_time_ms,

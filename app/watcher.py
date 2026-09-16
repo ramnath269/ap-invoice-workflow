@@ -6,11 +6,13 @@ nodes.
 """
 import logging
 import os
+import threading
 import time
 
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
+from . import reprocess_api
 from .graph import build_graph
 from .logging_config import configure_logging
 from .settings import settings, validate
@@ -62,6 +64,13 @@ def watch() -> None:
     os.makedirs(os.path.join(settings.WATCH_FOLDER, settings.PROCESSED_SUBFOLDER), exist_ok=True)
 
     graph = build_graph()
+
+    # Started before the observer so a bind failure (e.g. port already in
+    # use) fails the service loudly at startup instead of silently degrading
+    # a folder watcher that otherwise looks healthy.
+    reprocess_thread = threading.Thread(target=reprocess_api.run, daemon=True, name="reprocess-api")
+    reprocess_thread.start()
+
     handler = _NewFileHandler(graph)
     observer = Observer()
     observer.schedule(handler, settings.WATCH_FOLDER, recursive=False)
