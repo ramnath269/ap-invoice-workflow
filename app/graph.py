@@ -24,10 +24,13 @@ achieves the same guarantee more simply.
 
 Everything else, including the If2 gate on PO receipt records, is
 preserved. config/schema_fields.json is no longer read at graph-run time -
-Document AI's custom extractor has its own fixed schema (configured on the
-processor itself, not per-request) - but schema_builder.account_number_for()
-is still used by attach_account_numbers.
+extract_fields' first call always uses the custom extractor's own stored
+schema; only a targeted retry (see extract_fields, document_ai.
+build_schema_override) sends a per-request processOptions.schemaOverride
+for the specific fields that came back missing/low-confidence - but
+schema_builder.account_number_for() is still used by attach_account_numbers.
 """
+import base64
 import json
 import logging
 import os
@@ -37,7 +40,15 @@ import uuid
 
 from langgraph.graph import END, START, StateGraph
 
-from . import document_ai, invoice_server, jde_client, jde_mcp_client, schema_builder
+from . import (
+    document_ai,
+    invoice_server,
+    jde_client,
+    jde_mcp_client,
+    pdf_text_layer,
+    schema_builder,
+    vendor_schema,
+)
 from .settings import settings
 from .state import InvoiceState
 
@@ -175,58 +186,204 @@ def extract_fields(state: InvoiceState) -> dict:
     The processor's foundation-model backend isn't fully deterministic call
     to call (see document_ai.find_extraction_issues' docstring for the
     evidence), so a response missing a required field or holding low
-    confidence on one gets exactly one retry before we accept whatever the
-    second call returns - better odds of a clean extraction without an
-    unbounded retry loop against a live API."""
+    confidence on one gets exactly one targeted retry: instead of blindly
+    re-running the whole 26-field schema, it identifies the vendor from the
+    first call's own "vendor" extraction, looks up that vendor's
+    field-specific extraction rules (vendor_schema.get_vendor_field_overrides,
+    backed by invoice-server's vendor-extract-schema CouchDB store), and asks
+    Document AI for ONLY the missing/low-confidence fields via
+    processOptions.schemaOverride - cheaper than a full second pass, and more
+    likely to succeed than retrying with the same generic, multi-vendor field
+    description that may have contributed to the miss. A vendor that can't be
+    classified (blank/unrecognized "vendor" text) or has no seeded overrides
+    still gets a same-fields retry using the processor's own generic
+    descriptions, so plain model flakiness still benefits. The override
+    retry never raises on failure - a lookup or override-call problem falls
+    back to the first call's result rather than losing an otherwise-usable
+    extraction.
+
+    Vendors in vendor_schema.LINE_MATH_VENDORS additionally get an
+    arithmetic check (quantity x unit_price == amount per line, lines sum to
+    the total): a failure triggers a full product re-extraction that replaces
+    the first call's product list if it scores better, and
+    document_ai.repair_line_math then fixes any single value per line the
+    arithmetic uniquely supports."""
     started = time.monotonic()
     try:
         raw = document_ai.process_document(state["base64_content"], state["mime_type"])
     except Exception as exc:
         _time_dependency("document_ai", "process_document", started, "error", f"{type(exc).__name__}: {exc}")
         raise
+    timings = [_time_dependency("document_ai", "process_document", started, "ok")]
+
+    extracted = document_ai.parse_entities(raw)["output"]
 
     issues = document_ai.find_extraction_issues(raw)
-    if issues:
-        logger.warning(
-            "extract_fields: retrying document_ai.process_document once - %d issue(s) found: %s",
-            len(issues), "; ".join(issues),
-        )
-        try:
-            raw = document_ai.process_document(state["base64_content"], state["mime_type"])
-        except Exception as exc:
-            _time_dependency("document_ai", "process_document", started, "error", f"{type(exc).__name__}: {exc}")
-            raise
-        retry_issues = document_ai.find_extraction_issues(raw)
-        if retry_issues:
+    missing = document_ai.find_missing_fields(raw)
+    vendor_name = vendor_schema.classify_vendor(extracted.get("vendor"))
+
+    # For a vendor whose lines obey quantity x unit_price == amount, a
+    # present-but-misread value (dropped digit/decimal point, Q read as O)
+    # never shows up as missing or low-confidence. Arithmetic catches it, and
+    # the retry then re-extracts every product field and replaces the first
+    # call's product list outright - an item-anchored fill-only merge can't
+    # correct a value that's present, nor realign rows by an item number
+    # that is itself one of the misreads being corrected.
+    line_math = vendor_name in vendor_schema.LINE_MATH_VENDORS
+    replace_products = False
+    if line_math:
+        line_math_issues = document_ai.find_line_math_issues(extracted)
+        if line_math_issues["bad_rows"] or not line_math_issues["sum_ok"]:
             logger.warning(
-                "extract_fields: retry still has %d issue(s), proceeding anyway (retry budget exhausted): %s",
-                len(retry_issues), "; ".join(retry_issues),
+                "extract_fields: %d line(s) fail quantity x unit_price == amount, line sum %s vs "
+                "expected %s - retrying with a full product re-extraction",
+                len(line_math_issues["bad_rows"]), line_math_issues["line_sum"], line_math_issues["expected"],
+            )
+            missing["product"] |= document_ai.FULL_PRODUCT_RETRY_FIELDS
+            replace_products = True
+
+    if missing["top_level"] or missing["product"]:
+        logger.warning(
+            "extract_fields: %d issue(s) found, retrying with a targeted schemaOverride for %s: %s",
+            len(issues), sorted(missing["top_level"] | missing["product"]), "; ".join(issues),
+        )
+        vendor_fields = vendor_schema.get_vendor_field_overrides(vendor_name) if vendor_name else {}
+        base_schema = document_ai.fetch_live_schema()
+        override = document_ai.build_schema_override(missing, vendor_fields, base_schema)
+
+        override_started = time.monotonic()
+        try:
+            override_raw = document_ai.process_document(
+                state["base64_content"], state["mime_type"], schema_override=override
+            )
+            timings.append(_time_dependency("document_ai", "process_document_override", override_started, "ok"))
+            extracted_override = document_ai.parse_entities(override_raw)["output"]
+            first_score = document_ai.line_math_score(extracted) if replace_products else None
+            override_score = document_ai.line_math_score(extracted_override) if replace_products else None
+            if replace_products and override_score > first_score:
+                logger.info(
+                    "extract_fields: full product re-extraction scored better (consistent lines, sum ok) "
+                    "%s vs first call %s - replacing product list", override_score, first_score,
+                )
+                products = extracted_override["products"]
+                filled = document_ai.backfill_products(products, extracted.get("products", []))
+                logger.info("extract_fields: filled %d empty product field(s) from the first call's lines", filled)
+                extracted = document_ai.merge_extracted(
+                    extracted, extracted_override, {"top_level": missing["top_level"], "product": set()}
+                )
+                extracted["products"] = products
+            else:
+                if replace_products:
+                    logger.info(
+                        "extract_fields: full product re-extraction scored %s, not better than first call %s "
+                        "- only filling empty fields", override_score, first_score,
+                    )
+                extracted = document_ai.merge_extracted(extracted, extracted_override, missing)
+        except Exception as exc:
+            timings.append(_time_dependency(
+                "document_ai", "process_document_override", override_started, "error",
+                f"{type(exc).__name__}: {exc}",
+            ))
+            logger.warning(
+                "extract_fields: schemaOverride retry failed (%s), proceeding with the first call's result",
+                exc,
             )
 
-    timing = _time_dependency("document_ai", "process_document", started, "ok")
+    moved_charges = document_ai.move_charge_lines(extracted)
+    if moved_charges:
+        logger.info("extract_fields: moved %d freight/handling line(s) out of products: %s", len(moved_charges), moved_charges)
+
+    # Document AI reads the page image even when the PDF embeds exact text,
+    # so item numbers it misreads (Q as O on dot-matrix prints) can be
+    # corrected from the text layer. A no-op for scans.
+    if state["mime_type"] == "application/pdf":
+        text_lines = pdf_text_layer.read_text_lines(base64.b64decode(state["base64_content"]))
+        if text_lines:
+            corrections = pdf_text_layer.correct_items(extracted.get("products", []), text_lines)
+            if corrections:
+                logger.info(
+                    "extract_fields: corrected %d item number(s) from the PDF text layer: %s",
+                    len(corrections), "; ".join(corrections),
+                )
+            fixed = pdf_text_layer.fix_descriptions(extracted.get("products", []), text_lines)
+            if fixed:
+                logger.info("extract_fields: set %d empty/garbled description(s) from the PDF text layer", fixed)
+
+    if line_math:
+        repairs = document_ai.repair_line_math(extracted)
+        remaining = document_ai.find_line_math_issues(extracted)
+        logger.info(
+            "extract_fields: line-math repaired %d value(s)%s; %d line(s) still inconsistent, line sum %s vs expected %s",
+            len(repairs), (": " + "; ".join(repairs)) if repairs else "",
+            len(remaining["bad_rows"]), remaining["line_sum"], remaining["expected"],
+        )
+
     not_an_invoice = not document_ai.looks_like_invoice(raw)
-    extracted = document_ai.parse_entities(raw)["output"]
     return {
         "extracted": extracted,
         "parse_error": False,
         "not_an_invoice": not_an_invoice,
-        "dependency_timings": [timing],
+        "dependency_timings": timings,
     }
 
 
+def has_valid_order_number(order_number) -> bool:
+    """JDE order numbers are purely numeric - anything else (letters, dashes,
+    spaces, OCR noise like "35760Z") can't be a real PO and would only come
+    back from JDE as a misleading "order not found"."""
+    return str(order_number or "").strip().isascii() and str(order_number or "").strip().isdigit()
+
+
 def route_after_parse(state: InvoiceState) -> str:
-    missing_order_number = not (state.get("extracted") or {}).get("purchase_order")
+    order_number = (state.get("extracted") or {}).get("purchase_order")
+    missing_order_number = not order_number
+    incorrect_order_number = not missing_order_number and not has_valid_order_number(order_number)
     if state.get("parse_error"):
         route = "handle_parse_error"
     elif state.get("not_an_invoice"):
         route = "handle_not_an_invoice"
     elif missing_order_number:
         route = "handle_missing_order_number"
+    elif incorrect_order_number:
+        route = "handle_incorrect_order_number"
     else:
-        route = "build_voucher_payload"
+        route = "check_already_processed"
     logger.info(
         ">> ROUTE   route_after_parse: parse_error=%s not_an_invoice=%s missing_order_number=%s => %s",
         state.get("parse_error"), state.get("not_an_invoice"), missing_order_number, route,
+    )
+    return route
+
+
+# Not a JDE ErrorMessage classification (contrast jde_client.
+# ERROR_DUPLICATE_INVOICE/ERROR_ORDER_NOT_FOUND) - this is our own local
+# duplicate check, so it lives here rather than in jde_client.py.
+ALREADY_PROCESSED = "already_processed"
+
+
+def check_already_processed(state: InvoiceState) -> dict:
+    """Looks up invoice-server for an existing SUCCESSFUL purchase_order
+    record on the same (OrderNumber, VendorInvoiceNo) before ever calling
+    JDE again. Catches the case JDE's own duplicate-invoice check doesn't:
+    the same invoice resubmitted (e.g. the folder watcher/email watcher
+    seeing the same file twice, or a person re-uploading it) at a point
+    where JDE's voucher-match doesn't happen to flag it as a duplicate
+    itself, which previously sailed straight through to create_po and
+    produced a second row in the dashboard for an invoice already showing
+    there as processed."""
+    extracted = state["extracted"]
+    order_number = str(extracted.get("purchase_order") or "")
+    vendor_invoice_no = extracted.get("invoice_number") or ""
+    existing = invoice_server.find_existing_po(order_number, vendor_invoice_no)
+    return {"already_processed_doc": existing}
+
+
+def route_after_already_processed_check(state: InvoiceState) -> str:
+    route = "handle_already_processed" if state.get("already_processed_doc") else "build_voucher_payload"
+    logger.info(
+        ">> ROUTE   route_after_already_processed_check: already_processed=%s => %s",
+        bool(state.get("already_processed_doc")),
+        route,
     )
     return route
 
@@ -300,8 +457,9 @@ def resolve_item_numbers(state: InvoiceState) -> dict:
     """Fixes up lines where JDE's voucher-match couldn't resolve the
     supplier's item number (a rowset entry with a non-blank Message, e.g.
     "Unable to fetch Order/Item information"). Tries the invoice-server
-    item_crossref cache first - a previously user-confirmed mapping applies
-    immediately, no review needed - and on a cache miss falls back to
+    item_crossref cache first - a previously user-confirmed mapping becomes a
+    pending suggestion (match_basis "crossref") without touching the extracted
+    item number - and on a cache miss falls back to
     fetching the PO's lines via jde_mcp_client and fuzzy-matching by
     quantity + unit price, attaching any single confident match as a
     suggestion for dashboard review rather than applying it outright.
@@ -365,7 +523,24 @@ def _resolve_item_numbers(state: InvoiceState) -> dict:
             logger.info(
                 "resolve_item_numbers: cache hit, supplier=%s item=%s -> %s", supplier_number, pdf_item_number, assigned
             )
-            product["item"] = assigned
+            # Surfaced as a pending suggestion like any other match (pdf_fields'
+            # item number is left as extracted) - a person still confirms it in the
+            # dashboard.
+            try:
+                cache_quantity = float(product.get("quantity") or 0)
+                cache_unit_price = float(product.get("unit_price") or 0)
+            except (TypeError, ValueError):
+                cache_quantity = cache_unit_price = 0.0
+            suggestions.append(
+                {
+                    "line_index": idx,
+                    "pdf_item_number": pdf_item_number,
+                    "suggested_jde_item_number": str(assigned),
+                    "quantity": cache_quantity,
+                    "unit_price": cache_unit_price,
+                    "match_basis": "crossref",
+                }
+            )
             continue
 
         try:
@@ -518,6 +693,35 @@ def handle_duplicate_invoice(state: InvoiceState) -> dict:
     return _handle_voucher_match_exception(state, jde_client.ERROR_DUPLICATE_INVOICE)
 
 
+def handle_already_processed(state: InvoiceState) -> dict:
+    """Routed here by route_after_already_processed_check when
+    check_already_processed found an existing SUCCESSFUL purchase_order
+    record for the same OrderNumber/VendorInvoiceNo. Recorded as its own
+    exception_reason rather than reusing ERROR_DUPLICATE_INVOICE: unlike
+    that case, this isn't a JDE-side data problem a corrected invoice number
+    can fix, so the dashboard's "reprocess with corrected invoice number"
+    action (built for the JDE case) doesn't apply here - it just needs a
+    person to notice the resubmission and discard it.
+
+    erp_fields comes from the EXISTING record (not this run, which never
+    called JDE) so the dashboard row still shows vendor name/amount instead
+    of just the bare OrderNumber/VendorInvoiceNo used to find it."""
+    existing = state.get("already_processed_doc") or {}
+    extracted = state.get("extracted") or {}
+    order_number = extracted.get("purchase_order")
+    vendor_invoice_no = extracted.get("invoice_number")
+    erp_fields = existing.get("erp_fields") or {
+        "OrderNumber": order_number,
+        "VendorInvoiceNo": vendor_invoice_no,
+    }
+    error_message = (
+        f"This invoice (PO {order_number}, invoice #{vendor_invoice_no}) was already "
+        f"processed - see existing record {existing.get('_id')}."
+    )
+    logger.error("already_processed for %s: %s", state["file_name"], error_message)
+    return _record_exception_outcome(state, ALREADY_PROCESSED, erp_fields, error_message)
+
+
 def handle_order_not_found(state: InvoiceState) -> dict:
     return _handle_voucher_match_exception(state, jde_client.ERROR_ORDER_NOT_FOUND)
 
@@ -563,6 +767,23 @@ def handle_missing_order_number(state: InvoiceState) -> dict:
     )
 
 
+def handle_incorrect_order_number(state: InvoiceState) -> dict:
+    """Routed here by route_after_parse when the extracted purchase_order
+    contains any non-numeric character (has_valid_order_number). Caught before
+    JDE for the same reason as handle_missing_order_number."""
+    extracted = state.get("extracted") or {}
+    order_number = extracted.get("purchase_order")
+    vendor_invoice_no = extracted.get("invoice_number") or state["file_name"]
+    error_message = f"The order number '{order_number}' is not valid - order numbers must contain digits only."
+    logger.error("incorrect_order_number for %s: %s", state["file_name"], error_message)
+    return _record_exception_outcome(
+        state,
+        "incorrect_order_number",
+        {"OrderNumber": order_number, "VendorInvoiceNo": vendor_invoice_no},
+        error_message,
+    )
+
+
 def handle_parse_error(state: InvoiceState) -> dict:
     logger.error(
         "Field extraction failed to parse for %s: %s", state["file_name"], state.get("parse_error_message")
@@ -583,6 +804,7 @@ def build_graph():
     for name, fn in [
         ("read_and_encode_file", read_and_encode_file),
         ("extract_fields", extract_fields),
+        ("check_already_processed", check_already_processed),
         ("build_voucher_payload", build_voucher_payload),
         ("call_voucher_match", call_voucher_match),
         ("move_file_to_processed", move_file_to_processed),
@@ -592,9 +814,11 @@ def build_graph():
         ("report_metrics_success", report_metrics_success),
         ("skip_no_receipt", skip_no_receipt),
         ("handle_duplicate_invoice", handle_duplicate_invoice),
+        ("handle_already_processed", handle_already_processed),
         ("handle_order_not_found", handle_order_not_found),
         ("handle_not_an_invoice", handle_not_an_invoice),
         ("handle_missing_order_number", handle_missing_order_number),
+        ("handle_incorrect_order_number", handle_incorrect_order_number),
         ("handle_parse_error", handle_parse_error),
     ]:
         graph.add_node(name, _log_node(name, fn))
@@ -605,10 +829,20 @@ def build_graph():
         "extract_fields",
         route_after_parse,
         {
-            "build_voucher_payload": "build_voucher_payload",
+            "check_already_processed": "check_already_processed",
             "handle_not_an_invoice": "handle_not_an_invoice",
             "handle_missing_order_number": "handle_missing_order_number",
+            "handle_incorrect_order_number": "handle_incorrect_order_number",
             "handle_parse_error": "handle_parse_error",
+        },
+    )
+
+    graph.add_conditional_edges(
+        "check_already_processed",
+        route_after_already_processed_check,
+        {
+            "build_voucher_payload": "build_voucher_payload",
+            "handle_already_processed": "handle_already_processed",
         },
     )
 
@@ -632,6 +866,8 @@ def build_graph():
     graph.add_edge("report_metrics_success", END)
     graph.add_edge("skip_no_receipt", END)
     graph.add_edge("handle_duplicate_invoice", END)
+    graph.add_edge("handle_already_processed", END)
+    graph.add_edge("handle_incorrect_order_number", END)
     graph.add_edge("handle_order_not_found", END)
     graph.add_edge("handle_not_an_invoice", END)
     graph.add_edge("handle_missing_order_number", END)

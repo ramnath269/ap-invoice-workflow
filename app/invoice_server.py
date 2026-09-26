@@ -185,6 +185,45 @@ def lookup_item_crossref(supplier_number, item_number: str) -> str | None:
     return data.get("crossref", {}).get("assigned_item_number")
 
 
+def find_existing_po(order_number: str, vendor_invoice_no: str) -> dict | None:
+    """Looks up an existing SUCCESSFUL purchase_order doc (invoice-server's
+    GET /po/lookup - only matches docs with no exception_reason, i.e. ones
+    that made it all the way through create_po) for the same
+    (OrderNumber, VendorInvoiceNo). Called by graph.py's
+    check_already_processed before ever calling JDE, so reprocessing an
+    invoice that's already been fully processed gets caught locally instead
+    of only being caught on the cases JDE itself happens to flag as a
+    duplicate (see jde_client.ERROR_DUPLICATE_INVOICE). Returns None on a
+    miss OR on any error reaching invoice-server - a lookup failure here
+    should fall through to normal processing, not abort the run."""
+    try:
+        resp = requests.get(
+            f"{settings.INVOICE_SERVER_BASE_URL}/po/lookup",
+            params={"order_number": order_number, "vendor_invoice_no": vendor_invoice_no},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        logger.exception(
+            "invoice_server.find_existing_po: lookup failed for order=%s vendor_invoice=%s - treating as miss",
+            order_number,
+            vendor_invoice_no,
+        )
+        return None
+
+    if not data.get("found"):
+        return None
+    existing = data.get("po")
+    logger.info(
+        "invoice_server.find_existing_po: found existing record id=%s for order=%s vendor_invoice=%s",
+        (existing or {}).get("_id"),
+        order_number,
+        vendor_invoice_no,
+    )
+    return existing
+
+
 def report_metrics(
     execution_id: str,
     status: str,

@@ -32,6 +32,14 @@ class InvoiceState(TypedDict, total=False):
     # handle_not_an_invoice instead of ever calling JDE.
     not_an_invoice: bool
 
+    # check_already_processed: an existing SUCCESSFUL purchase_order record
+    # (invoice_server.find_existing_po) for the same OrderNumber/
+    # VendorInvoiceNo, found BEFORE ever calling JDE again - None means no
+    # local match, so processing continues to build_voucher_payload as
+    # normal. Distinct from voucher_match_error's ERROR_DUPLICATE_INVOICE,
+    # which is JDE catching the same thing on its own side.
+    already_processed_doc: dict | None
+
     # Code in JavaScript2 + Voucher Match + Edit Fields2
     voucher_match_payload: dict
     voucher_match_response: dict

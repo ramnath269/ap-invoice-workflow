@@ -1,5 +1,6 @@
 """Internal HTTP endpoint for retrying voucher-match on a corrected invoice
-number, for the "duplicate_invoice" exception case.
+number, for any exception case (duplicate_invoice, already_processed,
+order_not_found, missing_order_number, not_an_invoice).
 
 Run as a background thread inside app/watcher.py's process (see watch()) -
 not the full LangGraph (that starts at read_and_encode_file/extract_fields,
@@ -40,11 +41,55 @@ def reprocess_duplicate_invoice():
         logger.exception("reprocess_duplicate_invoice: fetch failed for %s", record_id)
         return jsonify({"error": f"Could not load invoice record: {exc}"}), 502
 
-    if record.get("exception_reason") != jde_client.ERROR_DUPLICATE_INVOICE:
-        return jsonify({"error": "Not a duplicate_invoice exception - reprocess not applicable."}), 404
+    if not record.get("exception_reason"):
+        return jsonify({"error": "Not an exception record - reprocess not applicable."}), 404
 
     extracted = dict(record.get("pdf_fields") or {})
     extracted["invoice_number"] = new_invoice_number
+
+    if extracted.get("purchase_order") and not graph.has_valid_order_number(extracted.get("purchase_order")):
+        error_message = (
+            f"The order number '{extracted.get('purchase_order')}' is not valid - "
+            "order numbers must contain digits only."
+        )
+        try:
+            invoice_server.update_po(
+                record_id,
+                pdf_fields={**extracted, "status": "EXCEPTION"},
+                erp_fields={"OrderNumber": extracted.get("purchase_order"), "VendorInvoiceNo": new_invoice_number},
+                exception_reason="incorrect_order_number",
+                error_message=error_message,
+            )
+        except Exception as exc:
+            logger.exception("reprocess_duplicate_invoice: save failed (incorrect_order_number) for %s", record_id)
+            return jsonify({"error": f"Order number is invalid, but saving the update failed: {exc}"}), 502
+        return jsonify(
+            {"outcome": "exception", "exception_reason": "incorrect_order_number", "error_message": error_message}
+        ), 200
+
+    # Same local check the main graph runs before JDE (graph.check_already_processed):
+    # a corrected number that collides with a different, already-successful record
+    # is still a duplicate, and JDE wouldn't necessarily say so.
+    existing = invoice_server.find_existing_po(str(extracted.get("purchase_order") or ""), new_invoice_number)
+    if existing and existing.get("_id") != record_id:
+        error_message = (
+            f"This invoice (PO {extracted.get('purchase_order')}, invoice #{new_invoice_number}) "
+            f"was already processed - see existing record {existing.get('_id')}."
+        )
+        try:
+            invoice_server.update_po(
+                record_id,
+                pdf_fields={**extracted, "status": "EXCEPTION"},
+                erp_fields=existing.get("erp_fields") or {},
+                exception_reason=graph.ALREADY_PROCESSED,
+                error_message=error_message,
+            )
+        except Exception as exc:
+            logger.exception("reprocess_duplicate_invoice: save failed (already_processed) for %s", record_id)
+            return jsonify({"error": f"Already processed, but saving the update failed: {exc}"}), 502
+        return jsonify(
+            {"outcome": "exception", "exception_reason": graph.ALREADY_PROCESSED, "error_message": error_message}
+        ), 200
     payload = jde_client.build_payload(extracted)
 
     logger.info(

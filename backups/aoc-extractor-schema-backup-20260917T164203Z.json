@@ -1,0 +1,245 @@
+{
+  "name": "projects/678280534943/locations/us/processors/cf3e6a8379c1e4c5/dataset/datasetSchema",
+  "documentSchema": {
+    "displayName": "aoc-extractor-schema",
+    "description": "Unified invoice extraction schema for GM/ACDelco, Ford Customer Service Division, Advanced Distribution Services (ADS), and Federal-Mogul Motorparts invoices, mapped to the AOC app's target output fields.",
+    "entityTypes": [
+      {
+        "name": "custom_extraction_document_type",
+        "baseTypes": [
+          "document"
+        ],
+        "properties": [
+          {
+            "name": "invoice_date",
+            "valueType": "string",
+            "occurrenceType": "REQUIRED_ONCE",
+            "propertyMetadata": {},
+            "description": "The invoice date. On GM/ACDelco invoices this is labeled 'Invoice Date' (MM/DD/YYYY), near the top and repeated in the header table. On Ford Customer Service Division invoices this is labeled 'Date Invoiced' (MM-DD-YY), top-right box. On Advanced Distribution Services (ADS) invoices, use the 'Finalized Date' value near the top right (fall back to 'Created Date' if Finalized Date is absent). On Federal-Mogul Motorparts invoices, use the 'DATE' value in the header box (MM/DD/YY).",
+            "method": "EXTRACT"
+          },
+          {
+            "name": "vendor",
+            "valueType": "string",
+            "occurrenceType": "OPTIONAL_ONCE",
+            "propertyMetadata": {},
+            "description": "The full, exact company name of the vendor/seller issuing this invoice, as printed on a SINGLE physical line of the document - never span multiple lines or include a line break in the extracted value. If the company's name appears in more than one place on the page (e.g. a short logo/brand word like 'Ford' or 'GM' at the top, and a fuller name on one line elsewhere such as in the letterhead, footer, or 'Remit To' section like 'Ford Motor Company', 'GM Customer Care and Aftersales', 'Advanced Distribution Services', or 'Federal-Mogul Motorparts LLC'), extract the fullest single line you find, not the shortest. If the fullest occurrence is split across two lines (e.g. 'FORD MOTOR COMPANY' on one line and 'FORD CUSTOMER SERVICE DIVISION' on the next), extract only the first line, not both. Only copy text that is literally printed on the page - never abbreviate, paraphrase, translate, or invent a name that does not appear verbatim in the document. Do not extract the customer/buyer name.",
+            "method": "EXTRACT"
+          },
+          {
+            "name": "purchase_order",
+            "valueType": "string",
+            "occurrenceType": "OPTIONAL_ONCE",
+            "propertyMetadata": {},
+            "description": "The customer's purchase order number. On Ford invoices this is the 'Customer P.O. Number' value in the top-left box. On ADS invoices, use the 'CUSTOMER PO #' value. On Federal-Mogul invoices, use the 'CUSTOMER ORDER NO.' value. On GM/ACDelco invoices, use the 'Control #' column value from the line-item table (it is the same value repeated on every row of that table - use that single repeated value).",
+            "method": "EXTRACT"
+          },
+          {
+            "name": "due_date",
+            "valueType": "string",
+            "occurrenceType": "OPTIONAL_ONCE",
+            "propertyMetadata": {},
+            "description": "The payment due date. On GM/ACDelco invoices this is labeled 'Due Date' near the top. Ford invoices have no single labeled due date - use the earliest installment date shown in the 'Invoice Payment Information' schedule at the bottom (e.g. the first of the three date columns like '09-15-26'). ADS and Federal-Mogul invoices do not print an explicit due date - leave blank for those.",
+            "method": "EXTRACT"
+          },
+          {
+            "name": "payment_terms",
+            "valueType": "string",
+            "occurrenceType": "OPTIONAL_ONCE",
+            "propertyMetadata": {},
+            "description": "The payment terms text. On GM/ACDelco invoices this is the full paragraph next to 'Payment Terms'. On Ford invoices this is a short code like '1% 30-60-90 DAYS' next to 'Payment Terms'. On ADS invoices, use the 'Terms' value near the top-left (e.g. 'Net 30'). On Federal-Mogul invoices, use the 'TERMS*' value in the header box (e.g. '2% 3RD 10TH PROX.').",
+            "method": "EXTRACT"
+          },
+          {
+            "name": "sub_total",
+            "valueType": "string",
+            "occurrenceType": "OPTIONAL_ONCE",
+            "propertyMetadata": {},
+            "description": "The invoice subtotal before taxes. On GM/ACDelco invoices use the 'Total Gross Amount' value from the summary totals. On Ford invoices use the 'Extended Price' total shown on the 'INVOICE TOTAL' row. On ADS invoices, use the 'Total Cost' value from the totals table near the bottom. On Federal-Mogul invoices, use the explicit 'SUB-TOTAL' line.",
+            "method": "EXTRACT"
+          },
+          {
+            "name": "county_level_tax",
+            "valueType": "string",
+            "occurrenceType": "OPTIONAL_ONCE",
+            "propertyMetadata": {},
+            "description": "County-level tax amount. On GM/ACDelco invoices this is the 'County Tax' line in the summary totals (typically $0.00). Ford, ADS, and Federal-Mogul invoices do not show a county-specific tax line - leave blank.",
+            "method": "EXTRACT"
+          },
+          {
+            "name": "state_level_tax",
+            "valueType": "string",
+            "occurrenceType": "OPTIONAL_ONCE",
+            "propertyMetadata": {},
+            "description": "State-level tax amount. On GM/ACDelco invoices this is the 'State Tax' line in the summary totals (typically $0.00). Ford, ADS, and Federal-Mogul invoices do not show a state-specific tax line - leave blank.",
+            "method": "EXTRACT"
+          },
+          {
+            "name": "sales_tax",
+            "valueType": "string",
+            "occurrenceType": "OPTIONAL_ONCE",
+            "propertyMetadata": {},
+            "description": "General sales tax amount. On GM/ACDelco invoices this is the 'City Tax' line in the summary totals (typically $0.00). On ADS invoices, use the 'TotalTax' value from the totals table near the bottom. Ford and Federal-Mogul invoices do not show a tax line - leave blank.",
+            "method": "EXTRACT"
+          },
+          {
+            "name": "special_level_tax",
+            "valueType": "string",
+            "occurrenceType": "OPTIONAL_ONCE",
+            "propertyMetadata": {
+              "inactive": true
+            },
+            "description": "Special district tax amount, if shown. None of GM/ACDelco, Ford, ADS, or Federal-Mogul invoices print a distinct special district tax line - leave blank unless one is explicitly labeled 'special tax' or similar.",
+            "method": "EXTRACT"
+          },
+          {
+            "name": "total_freight",
+            "valueType": "string",
+            "occurrenceType": "OPTIONAL_ONCE",
+            "propertyMetadata": {},
+            "description": "Freight/shipping charges. On GM/ACDelco invoices this is the 'Total Shipping Charges' line in the summary totals (typically $0.00). On ADS invoices, use the 'Total Freight' value from the totals table near the bottom. On Federal-Mogul invoices, use the explicit 'FREIGHT' line. Ford invoices do not show a distinct freight line - leave blank.",
+            "method": "EXTRACT"
+          },
+          {
+            "name": "handling_fee",
+            "valueType": "string",
+            "occurrenceType": "OPTIONAL_ONCE",
+            "propertyMetadata": {},
+            "description": "Handling fee charges. On GM/ACDelco invoices this is the 'Total Other Charges' line in the summary totals (typically $0.00). On Federal-Mogul invoices, use the explicit 'HANDLING FEE' line. Ford and ADS invoices do not show a distinct handling fee line - leave blank.",
+            "method": "EXTRACT"
+          },
+          {
+            "name": "total_amount_due",
+            "valueType": "string",
+            "occurrenceType": "REQUIRED_ONCE",
+            "propertyMetadata": {},
+            "description": "The final total amount owed on the invoice. On GM/ACDelco invoices this is 'Net Invoice Amount' in the summary totals. On Ford invoices this is 'Total Amount Due', in the box near the bottom of the invoice (final page if multi-page). On ADS invoices, use the 'Invoice Total' value from the totals table near the bottom. On Federal-Mogul invoices, use the 'TOTAL INVOICE' value.",
+            "method": "EXTRACT"
+          },
+          {
+            "name": "invoice_number",
+            "valueType": "string",
+            "occurrenceType": "REQUIRED_ONCE",
+            "propertyMetadata": {},
+            "description": "The invoice number. Labeled 'Invoice Number' near the top on GM/ACDelco invoices, and in the top-right box on Ford invoices. On ADS invoices, use the 'INVOICE NUMBER' value (e.g. 'S1-103624'). On Federal-Mogul invoices, use the 'INVOICE NO.' value in the header box.",
+            "method": "EXTRACT"
+          },
+          {
+            "name": "currency",
+            "valueType": "string",
+            "occurrenceType": "OPTIONAL_ONCE",
+            "propertyMetadata": {
+              "inactive": true
+            },
+            "description": "Ignore this field during extraction",
+            "method": "EXTRACT"
+          },
+          {
+            "name": "products",
+            "valueType": "products",
+            "occurrenceType": "OPTIONAL_MULTIPLE",
+            "propertyMetadata": {},
+            "description": "One entry per line item row in the invoice's line-item table.",
+            "method": "EXTRACT"
+          }
+        ],
+        "entityTypeMetadata": {}
+      },
+      {
+        "name": "products",
+        "baseTypes": [
+          "object"
+        ],
+        "properties": [
+          {
+            "name": "item",
+            "valueType": "string",
+            "occurrenceType": "REQUIRED_MULTIPLE",
+            "propertyMetadata": {},
+            "description": "The primary part/item identifier for this line. On GM/ACDelco invoices use the 'Part No Shipped' column value (not 'Part No Ordered' - that belongs in supplier_item_number). On Ford invoices use the combined Part Number (PREFIX + BASE + SUFFIX columns, e.g. 'FA 1883'). On ADS invoices use the 'Item #' column (e.g. '16-PB-DS'). On Federal-Mogul invoices use the 'PART NUMBER' column (e.g. 'SFL35889').",
+            "method": "EXTRACT"
+          },
+          {
+            "name": "description",
+            "valueType": "string",
+            "occurrenceType": "OPTIONAL_ONCE",
+            "propertyMetadata": {},
+            "description": "The item's description. On GM/ACDelco invoices use the 'Part Name' column value (e.g. 'BATW/EXCH'). On Ford invoices use the 'Part Description' text shown once to the left of the block of part-number rows it applies to (e.g. 'FILTERS', 'CHEMICALS', 'MOTORCRAFT LT REPAIR') - apply it to every row in that block. On ADS invoices use the 'Desc' column. On Federal-Mogul invoices use the 'PRODUCT DESCRIPTION' column (e.g. 'Water Pump Gasket').",
+            "method": "EXTRACT"
+          },
+          {
+            "name": "quantity",
+            "valueType": "string",
+            "occurrenceType": "OPTIONAL_ONCE",
+            "propertyMetadata": {},
+            "description": "The quantity for this line. Labeled 'Qty' on GM/ACDelco and Ford invoices. On ADS invoices use the 'Ship' column (quantity shipped). On Federal-Mogul invoices use the 'SHIPPED' column under 'QUANTITIES'.",
+            "method": "EXTRACT"
+          },
+          {
+            "name": "unit_price",
+            "valueType": "string",
+            "occurrenceType": "OPTIONAL_ONCE",
+            "propertyMetadata": {},
+            "description": "The price per unit for this line. Labeled 'Unit Price' on GM/ACDelco and Ford invoices. On ADS invoices use the 'Cost' column. On Federal-Mogul invoices use the 'UNIT' column under 'PRICING DATA' (e.g. '18.29') - not the separate blank 'UNIT' column under 'QUANTITIES'.",
+            "method": "EXTRACT"
+          },
+          {
+            "name": "unit_of_measure",
+            "valueType": "string",
+            "occurrenceType": "OPTIONAL_ONCE",
+            "propertyMetadata": {},
+            "description": "The unit of measure for this line. On Ford invoices use the 'Unit Issue' column value (e.g. '0001'). On Federal-Mogul invoices use the 'UNIT' column under 'QUANTITIES' (separate from the pricing 'UNIT' column), if populated. Not present on GM/ACDelco or ADS invoices - leave blank.",
+            "method": "EXTRACT"
+          },
+          {
+            "name": "amount",
+            "valueType": "string",
+            "occurrenceType": "OPTIONAL_ONCE",
+            "propertyMetadata": {},
+            "description": "The net extended dollar amount for this line after discounts. On GM/ACDelco invoices use the 'Net Amt' column. On Ford invoices use the 'Extended Net Amt' column. On ADS invoices use the 'Extended' column. On Federal-Mogul invoices use the 'NET EXTENDED' column.",
+            "method": "EXTRACT"
+          },
+          {
+            "name": "supplier_item_number",
+            "valueType": "string",
+            "occurrenceType": "OPTIONAL_ONCE",
+            "propertyMetadata": {
+              "inactive": true
+            },
+            "description": "The supplier's part number for this line as originally ordered. On GM/ACDelco invoices use the 'Part No Ordered' column value. Not present on Ford, ADS, or Federal-Mogul invoices - leave blank.",
+            "method": "EXTRACT"
+          },
+          {
+            "name": "purchase_order_number",
+            "valueType": "string",
+            "occurrenceType": "OPTIONAL_ONCE",
+            "propertyMetadata": {},
+            "description": "The order/PO number associated with this line. On GM/ACDelco invoices use the 'Control #' column value.  On Ford, ADS, and Federal-Mogul invoices, repeat the header-level purchase order / customer order number for every line (Ford: 'Customer P.O. Number'; ADS: 'CUSTOMER PO #'; Federal-Mogul: 'CUSTOMER ORDER NO.').",
+            "method": "EXTRACT"
+          },
+          {
+            "name": "item_number",
+            "valueType": "string",
+            "occurrenceType": "OPTIONAL_ONCE",
+            "propertyMetadata": {
+              "inactive": true
+            },
+            "description": "Ignore this field during extraction",
+            "method": "EXTRACT"
+          },
+          {
+            "name": "line_number",
+            "valueType": "string",
+            "occurrenceType": "OPTIONAL_ONCE",
+            "propertyMetadata": {
+              "inactive": true
+            },
+            "description": "Ignore this field during extraction",
+            "method": "EXTRACT"
+          }
+        ],
+        "entityTypeMetadata": {}
+      }
+    ]
+  }
+}
